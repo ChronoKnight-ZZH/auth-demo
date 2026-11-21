@@ -1,0 +1,70 @@
+# 本地/测试用 MySQL 8.4 + Redis 7.2 编排
+# 对应方案 §4.2：资源受限下的显式内存上限
+#
+# 用法：docker compose up -d
+# 然后在 .env 中填入：
+#   MYSQL_URL=mysql://authdemo:authdemo_pw@127.0.0.1:3306/auth_demo
+#   REDIS_URL=redis://:authdemo_redis_pw@127.0.0.1:6379/0
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: auth-demo-mysql
+    restart: unless-stopped
+    command: >
+      --innodb-buffer-pool-size=512M
+      --performance-schema=OFF
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_0900_ai_ci
+      --bind-address=0.0.0.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pw_change_me
+      MYSQL_DATABASE: auth_demo
+      MYSQL_USER: authdemo
+      MYSQL_PASSWORD: authdemo_pw
+      TZ: UTC
+    ports:
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot_pw_change_me"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7.2
+    container_name: auth-demo-redis
+    restart: unless-stopped
+    # 关键：noeviction —— 会话是数据不是缓存，宁可写失败也不静默淘汰
+    command: >
+      redis-server
+      --requirepass authdemo_redis_pw
+      --maxmemory 256mb
+      --maxmemory-policy noeviction
+      --appendonly yes
+      --appendfsync everysec
+      --bind 0.0.0.0
+      --protected-mode no
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 400m
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "authdemo_redis_pw", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mysql-data:
+  redis-data:

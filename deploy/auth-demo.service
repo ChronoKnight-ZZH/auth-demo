@@ -1,0 +1,47 @@
+[Unit]
+Description=auth-demo API (Node.js)
+Documentation=https://example.invalid/auth-demo
+After=network-online.target mysqld.service redis.service
+Wants=network-online.target
+Requires=mysqld.service redis.service
+
+[Service]
+Type=simple
+User=authsvc
+Group=authsvc
+WorkingDirectory=/opt/auth-demo
+
+# 环境变量：权限 600，属主 root:authsvc
+EnvironmentFile=/etc/auth-demo/env
+
+# 密钥与 pepper 走 systemd 凭据注入（不落 EnvironmentFile）
+LoadCredential=rsa_private.pem:/etc/auth-demo/rsa_private.pem
+LoadCredential=rsa_public.pem:/etc/auth-demo/rsa_public.pem
+LoadCredential=pepper:/etc/auth-demo/pepper
+
+# 指向 systemd 凭据目录
+Environment=RSA_PRIVATE_KEY_PATH=%d/rsa_private.pem
+Environment=RSA_PUBLIC_KEY_PATH=%d/rsa_public.pem
+Environment=PEPPER_FILE=%d/pepper
+
+ExecStart=/usr/bin/node --max-old-space-size=384 src/server.js
+
+Restart=always
+RestartSec=2
+
+# 内存上限（方案 §4.2：2C4G 单机预算）
+MemoryHigh=450M
+MemoryMax=600M
+# 比 mysqld 更容易被 OOM 选中，优先保数据库
+OOMScoreAdjust=-200
+
+# 加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/auth-demo/.runtime
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

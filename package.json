@@ -1,0 +1,32 @@
+{
+  "name": "auth-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "后端登录与凭证验证 Demo：RSA-OAEP 传输 + Argon2id 持久化 + Opaque Token 版本化会话",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "keys": "node scripts/gen-keys.js",
+    "migrate": "node scripts/migrate.js --database",
+    "seed": "node scripts/seed.js --mysql",
+    "build": "node scripts/build.js",
+    "start": "node src/server.js",
+    "start:dist": "node dist/src/server.js",
+    "dev": "node src/server.js",
+    "mock:upstream": "node scripts/mock-upstream.js",
+    "test": "node test/unit.test.js && node --test test/stream.test.js",
+    "smoke": "node scripts/smoke.js",
+    "smoke:stream": "node scripts/smoke-stream.js",
+    "verify:gate": "node scripts/verify-gate.js",
+    "verify:webcrypto": "node scripts/verify-webcrypto.js",
+    "verify:all": "node test/unit.test.js && node --test test/stream.test.js && node scripts/smoke.js && node scripts/smoke-stream.js && node scripts/verify-gate.js && node scripts/verify-webcrypto.js"
+  },
+  "dependencies": {
+    "argon2": "^0.41.1",
+    "express": "^5.1.0",
+    "ioredis": "^5.4.1",
+    "mysql2": "^3.11.4"
+  }
+}

@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 · auth-demo</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px 0;
+    font: 15px/1.6 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #0f1115; color: #e6e8ee;
+  }
+  .card {
+    width: min(520px, calc(100vw - 32px)); padding: 30px;
+    background: #171a21; border: 1px solid #262b36; border-radius: 14px;
+  }
+  h1 { margin: 0 0 4px; font-size: 20px; }
+  .sub { margin: 0 0 22px; color: #8b93a5; font-size: 13px; }
+
+  /* ---- 三步流程 ---- */
+  .steps { list-style: none; margin: 0 0 22px; padding: 0; display: grid; gap: 8px; }
+  .step {
+    display: flex; gap: 12px; padding: 12px 14px;
+    border: 1px solid #262b36; border-radius: 10px; background: #12151c;
+    transition: border-color .15s ease, background .15s ease;
+  }
+  .step[data-state="running"] { border-color: #2f5f9e; background: #121b2a; }
+  .step[data-state="done"] { border-color: #1c4630; background: #101c16; }
+  .step[data-state="error"] { border-color: #45212a; background: #201316; }
+  .step-index {
+    flex: 0 0 24px; height: 24px; margin-top: 1px; border-radius: 50%;
+    display: grid; place-items: center; background: #232936; color: #a8b0c0;
+    font-size: 12px; font-weight: 700;
+  }
+  .step[data-state="running"] .step-index { background: #2563eb; color: #fff; }
+  .step[data-state="done"] .step-index { background: #16803f; color: #fff; }
+  .step[data-state="error"] .step-index { background: #b42318; color: #fff; }
+  .step-body { min-width: 0; flex: 1; }
+  .step-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; }
+  .step-detail {
+    margin-top: 3px; color: #8b93a5; font-size: 12px; line-height: 1.55;
+    word-break: break-all; white-space: pre-wrap;
+  }
+  .badge {
+    padding: 1px 7px; border-radius: 999px; background: #232936; color: #8b93a5;
+    font-size: 11px; font-weight: 500;
+  }
+  .step[data-state="running"] .badge { background: #1d3a66; color: #9cc3ff; }
+  .step[data-state="done"] .badge { background: #143d28; color: #6ee7a8; }
+  .step[data-state="error"] .badge { background: #4a1d25; color: #ff8b8b; }
+
+  /* ---- 表单 ---- */
+  fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+  fieldset:disabled { opacity: .55; }
+  label { display: block; margin: 0 0 6px; font-size: 13px; color: #a8b0c0; }
+  input {
+    width: 100%; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid #2c3240; background: #0f1218; color: #e6e8ee;
+    font: inherit; outline: none;
+  }
+  input:focus { border-color: #3b82f6; }
+  .field + .field { margin-top: 14px; }
+  button {
+    padding: 10px 14px; border: 0; border-radius: 8px;
+    background: #3b82f6; color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  button.secondary { background: #232936; color: #c7cedd; }
+  .submit { width: 100%; margin-top: 20px; padding: 11px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .actions:empty { display: none; }
+
+  /* ---- 结果 ---- */
+  .msg {
+    margin-top: 16px; padding: 10px 12px; border-radius: 8px;
+    font-size: 13px; display: none; word-break: break-all; white-space: pre-wrap;
+  }
+  .msg.err { display: block; background: #2a1416; color: #ff8b8b; border: 1px solid #45212a; }
+  .msg.ok  { display: block; background: #0f2418; color: #6ee7a8; border: 1px solid #1c4630; }
+  .msg.info { display: block; background: #121b2a; color: #9cc3ff; border: 1px solid #243b5e; }
+
+  .meta {
+    margin-top: 18px; padding-top: 14px; border-top: 1px solid #232833;
+    font-size: 12px; color: #6b7385; word-break: break-all; white-space: pre-wrap;
+  }
+  code { color: #8fb4ff; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>登录</h1>
+  <p class="sub">RSA-OAEP(SHA-256) 加密传输 · Argon2id 持久化 · Opaque Token</p>
+
+  <ol class="steps" aria-label="登录流程">
+    <li class="step" id="step1" data-state="pending">
+      <span class="step-index">1</span>
+      <div class="step-body">
+        <div class="step-title">获取公钥 <span class="badge" data-badge>等待</span></div>
+        <div class="step-detail" id="step1Detail">打开页面后自动请求 /auth/public-key</div>
+      </div>
+    </li>
+    <li class="step" id="step2" data-state="pending">
+      <span class="step-index">2</span>
+      <div class="step-body">
+        <div class="step-title">加密并登录 <span class="badge" data-badge>等待</span></div>
+        <div class="step-detail" id="step2Detail">提交后加密账号密码并 POST /auth/login</div>
+      </div>
+    </li>
+    <li class="step" id="step3" data-state="pending">
+      <span class="step-index">3</span>
+      <div class="step-body">
+        <div class="step-title">验证凭证 <span class="badge" data-badge>等待</span></div>
+        <div class="step-detail" id="step3Detail">登录成功后携带 Token 请求 /auth/me</div>
+      </div>
+    </li>
+  </ol>
+
+  <form id="f" novalidate>
+    <fieldset id="fields" disabled>
+      <div class="field">
+        <label for="u">账号</label>
+        <input id="u" autocomplete="username" required value="alice">
+      </div>
+      <div class="field">
+        <label for="p">密码</label>
+        <input id="p" type="password" autocomplete="current-password" required value="Alice@Passw0rd">
+      </div>
+      <button id="b" class="submit" type="submit" disabled>登录</button>
+    </fieldset>
+  </form>
+
+  <div class="actions">
+    <button id="retryKey" class="secondary" type="button" hidden>重新获取公钥</button>
+    <button id="retryMe" class="secondary" type="button" hidden>重新验证 /auth/me</button>
+  </div>
+
+  <div class="msg" id="m" role="status" aria-live="polite"></div>
+  <div class="meta" id="meta">尚未获取公钥。</div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var STEP_STATE = { PENDING: 'pending', RUNNING: 'running', DONE: 'done', ERROR: 'error' };
+  var BADGE_TEXT = { pending: '等待', running: '进行中', done: '已完成', error: '失败' };
+
+  var publicMeta = null; // { publicKey, algorithm, oaepHash, maxPlaintextBytes }
+  var cryptoKey = null;  // WebCrypto RSA-OAEP 公钥
+  var token = null;
+  var expiresAt = 0;
+
+  var $f = document.getElementById('f');
+  var $fields = document.getElementById('fields');
+  var $b = document.getElementById('b');
+  var $m = document.getElementById('m');
+  var $meta = document.getElementById('meta');
+  var $retryKey = document.getElementById('retryKey');
+  var $retryMe = document.getElementById('retryMe');
+
+  function $(id) { return document.getElementById(id); }
+
+  function setStep(n, state, detail) {
+    var el = $('step' + n);
+    el.setAttribute('data-state', state);
+    el.querySelector('[data-badge]').textContent = BADGE_TEXT[state] || state;
+    if (detail !== undefined) $('step' + n + 'Detail').textContent = detail;
+  }
+
+  function show(text, kind) {
+    $m.textContent = text || '';
+    $m.className = 'msg ' + (kind || '');
+  }
+
+  function b64(buf) {
+    var bytes = new Uint8Array(buf);
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s);
+  }
+
+  function utf8(str) { return new TextEncoder().encode(str); }
+
+  // 把后端返回的摘要名（sha256 / SHA256 / SHA-256 等）归一化成 WebCrypto 名称
+  function normalizeOaepHash(raw) {
+    var bits = String(raw || '').replace(/[^0-9]/g, '');
+    var map = { '1': 'SHA-1', '256': 'SHA-256', '384': 'SHA-384', '512': 'SHA-512' };
+    return map[bits] || 'SHA-256';
+  }
+
+  // "v1\n" + username 的 UTF-8 字节数 + "\n" + username + password
+  function encodePayload(username, password) {
+    var ub = utf8(username);
+    var head = utf8('v1\n' + ub.length + '\n');
+    var pb = utf8(password);
+    var out = new Uint8Array(head.length + ub.length + pb.length);
+    out.set(head, 0);
+    out.set(ub, head.length);
+    out.set(pb, head.length + ub.length);
+    return out;
+  }
+
+  async function readJson(response) {
+    var text = await response.text();
+    if (!text) return null;
+    try { return JSON.parse(text); } catch (e) { return { message: text }; }
+  }
+
+  function httpError(response, data, fallback) {
+    var err = new Error((data && data.message) || fallback || ('HTTP ' + response.status));
+    err.status = response.status;
+    err.code = data && data.code;
+    return err;
+  }
+
+  function describeError(err) {
+    var parts = [];
+    if (err && err.status) parts.push('HTTP ' + err.status);
+    if (err && err.code) parts.push(err.code);
+    var text = err && err.message ? err.message : String(err);
+    return (parts.length ? parts.join(' / ') + '：' : '') + text;
+  }
+
+  function setFormEnabled(enabled) {
+    $fields.disabled = !enabled;
+    $b.disabled = !enabled;
+  }
+
+  // ---- 步骤 1：获取公钥并导入 WebCrypto ----
+  async function loadPublicKey() {
+    publicMeta = null;
+    cryptoKey = null;
+    token = null;
+    expiresAt = 0;
+    setFormEnabled(false);
+    $retryKey.hidden = true;
+    $retryMe.hidden = true;
+    show('', '');
+    setStep(1, STEP_STATE.RUNNING, '正在请求 /auth/public-key…');
+    setStep(2, STEP_STATE.PENDING, '提交后加密账号密码并 POST /auth/login');
+    setStep(3, STEP_STATE.PENDING, '登录成功后携带 Token 请求 /auth/me');
+
+    try {
+      var response = await fetch('/auth/public-key', { cache: 'no-store' });
+      var data = await readJson(response);
+      if (!response.ok) throw httpError(response, data, '公钥获取失败');
+      if (!data || typeof data.publicKey !== 'string') throw new Error('公钥响应缺少 publicKey');
+
+      var hash = normalizeOaepHash(data.oaepHash);
+      var pem = data.publicKey
+        .replace(/-----BEGIN PUBLIC KEY-----/, '')
+        .replace(/-----END PUBLIC KEY-----/, '')
+        .replace(/\s+/g, '');
+      var der = Uint8Array.from(atob(pem), function (c) { return c.charCodeAt(0); });
+
+      cryptoKey = await crypto.subtle.importKey(
+        'spki', der,
+        { name: 'RSA-OAEP', hash: hash },
+        false, ['encrypt']
+      );
+
+      publicMeta = {
+        algorithm: data.algorithm || 'RSA-OAEP',
+        oaepHash: data.oaepHash || hash,
+        maxPlaintextBytes: Number(data.maxPlaintextBytes) || 190
+      };
+
+      $meta.textContent =
+        '接口：GET /auth/public-key\n' +
+        '算法：' + publicMeta.algorithm + ' / ' + publicMeta.oaepHash + '\n' +
+        '明文上限：' + publicMeta.maxPlaintextBytes + ' 字节';
+      setStep(1, STEP_STATE.DONE,
+        'HTTP ' + response.status + ' · ' + publicMeta.algorithm +
+        ' · ' + publicMeta.oaepHash +
+        ' · 上限 ' + publicMeta.maxPlaintextBytes + ' 字节');
+      setFormEnabled(true);
+      $('u').focus();
+    } catch (err) {
+      setStep(1, STEP_STATE.ERROR, describeError(err));
+      $meta.textContent = '公钥未就绪，无法加密登录。';
+      $retryKey.hidden = false;
+      show('获取公钥失败：' + describeError(err), 'err');
+    }
+  }
+
+  // ---- 步骤 3：用登录拿到的 Token 调 /auth/me ----
+  async function verifyMe() {
+    if (!token) {
+      setStep(3, STEP_STATE.ERROR, '没有可用的 Token，请先登录');
+      $retryMe.hidden = true;
+      return;
+    }
+    $retryMe.hidden = true;
+    setStep(3, STEP_STATE.RUNNING, '正在请求 GET /auth/me…');
+    try {
+      var response = await fetch('/auth/me', {
+        cache: 'no-store',
+        headers: { authorization: 'Bearer ' + token }
+      });
+      var data = await readJson(response);
+      if (!response.ok) throw httpError(response, data, '凭证验证失败');
+
+      setStep(3, STEP_STATE.DONE,
+        'HTTP ' + response.status + ' · /auth/me 返回：' + JSON.stringify(data));
+      show('登录成功，凭证验证通过。', 'ok');
+    } catch (err) {
+      setStep(3, STEP_STATE.ERROR, describeError(err));
+      show('凭证验证失败：' + describeError(err), 'err');
+    } finally {
+      $retryMe.hidden = !token;
+    }
+  }
+
+  // ---- 步骤 2：加密并登录，收到响应后自动执行步骤 3 ----
+  $f.addEventListener('submit', async function (ev) {
+    ev.preventDefault();
+    if (!publicMeta || !cryptoKey) {
+      show('公钥尚未就绪，请先重新获取公钥。', 'err');
+      return;
+    }
+
+    show('', '');
+    setFormEnabled(false);
+    $retryMe.hidden = true;
+    setStep(3, STEP_STATE.PENDING, '登录成功后携带 Token 请求 /auth/me');
+    setStep(2, STEP_STATE.RUNNING, '正在加密并发送 POST /auth/login…');
+
+    try {
+      var username = $('u').value;
+      var password = $('p').value;
+      if (!username.trim()) throw new Error('请输入账号');
+      if (!password) throw new Error('请输入密码');
+
+      var payload = encodePayload(username, password);
+      if (payload.length > publicMeta.maxPlaintextBytes) {
+        throw new Error('账号与密码合计 ' + payload.length +
+          ' 字节，超过 RSA-OAEP 上限 ' + publicMeta.maxPlaintextBytes + ' 字节');
+      }
+
+      var ciphertext = await crypto.subtle.encrypt(
+        { name: 'RSA-OAEP' }, cryptoKey, payload
+      );
+      var encrypted = b64(ciphertext);
+
+      var response = await fetch('/auth/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ encrypted: encrypted })
+      });
+      var data = await readJson(response);
+      if (!response.ok) throw httpError(response, data, '登录失败');
+      if (!data || typeof data.token !== 'string' || !data.token) {
+        throw new Error('登录响应缺少 token');
+      }
+
+      token = data.token;
+      expiresAt = Number(data.expiresAt) || 0;
+      // Demo 后端使用 Bearer Token；不是 httpOnly Cookie
+      sessionStorage.setItem('token', token);
+
+      setStep(2, STEP_STATE.DONE,
+        'HTTP ' + response.status +
+        ' · 明文 ' + payload.length + ' 字节' +
+        ' · 密文 ' + encrypted.length + ' 字符（Base64）' +
+        '\nToken：' + token.slice(0, 16) + '…（已截断）' +
+        '\n过期时间：' + (expiresAt ? new Date(expiresAt).toISOString() : '未返回'));
+
+      // 密码已经用完，避免继续留在输入框里
+      $('p').value = '';
+
+      await verifyMe();
+    } catch (err) {
+      setStep(2, STEP_STATE.ERROR, describeError(err));
+      setStep(3, STEP_STATE.PENDING, '登录未完成，未请求 /auth/me');
+      show('登录失败：' + describeError(err), 'err');
+    } finally {
+      setFormEnabled(Boolean(publicMeta && cryptoKey));
+      $retryMe.hidden = !token;
+    }
+  });
+
+  $retryKey.addEventListener('click', function () { loadPublicKey(); });
+  $retryMe.addEventListener('click', function () { verifyMe(); });
+
+  // 打开页面即进入步骤 1
+  loadPublicKey();
+})();
+</script>
+</body>
+</html>
