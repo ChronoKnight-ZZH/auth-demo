@@ -9,6 +9,10 @@ class UserRepo {
   async findByUsername(username) { throw new Error('not implemented'); }
   async findById(id) { throw new Error('not implemented'); }
   async updatePasswordHash(userId, phc, keyVersion) { throw new Error('not implemented'); }
+  async createUser({ username, passwordHash }) { throw new Error('not implemented'); }
+  async listUsers() { throw new Error('not implemented'); }
+  async setStatus(userId, status) { throw new Error('not implemented'); }
+  async revokeCredentials(userId) { throw new Error('not implemented'); }
   async ping() { throw new Error('not implemented'); }
   async seed(users) { throw new Error('not implemented'); }
   async close() {}

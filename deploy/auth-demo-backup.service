@@ -1,0 +1,22 @@
+[Unit]
+Description=auth-demo backup (MySQL + attachment blobs)
+After=network-online.target mysqld.service
+Requires=mysqld.service
+
+[Service]
+Type=oneshot
+User=authsvc
+Group=authsvc
+UMask=0027
+WorkingDirectory=/opt/auth-demo
+EnvironmentFile=/etc/auth-demo/env
+Environment=PATH=/opt/node/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env node scripts/backup.js
+
+# 目录权限由 authsvc 控制；systemd 219 兼容，不使用 ReadWritePaths/ProtectSystem
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+# 失败时保留 systemd 退出状态，便于 journal/告警查看
+SuccessExitStatus=0

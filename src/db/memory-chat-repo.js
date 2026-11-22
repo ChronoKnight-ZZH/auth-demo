@@ -46,9 +46,17 @@ class MemoryChatRepo extends ChatRepo {
     return session ? clone(session) : null;
   }
 
+  async hasSession(userId, id) {
+    return this._map(userId).has(id);
+  }
+
   async saveSession(userId, session) {
     this._map(userId).set(session.id, clone(session));
     return clone(session);
+  }
+
+  async purgeSession(userId, id) {
+    return this._map(userId).delete(id);
   }
 
   async renameSession(userId, id, title) {

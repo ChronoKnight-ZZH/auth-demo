@@ -1,0 +1,43 @@
+[Unit]
+Description=auth-demo API (Node.js, CentOS 7 / systemd 219)
+Documentation=https://chat.shunkai-dg.cn
+After=network-online.target mysqld.service redis.service
+Wants=network-online.target
+Requires=mysqld.service redis.service
+
+[Service]
+Type=simple
+User=authsvc
+Group=authsvc
+WorkingDirectory=/opt/auth-demo
+UMask=0027
+
+# CentOS 7 的 systemd 219 不支持 LoadCredential=，改为读取受权限保护的密钥文件；
+# 这些文件属主 root:authsvc、权限 600/640，服务用户只读。
+EnvironmentFile=/etc/auth-demo/env
+Environment=RSA_PRIVATE_KEY_PATH=/etc/auth-demo/rsa_private.pem
+Environment=RSA_PUBLIC_KEY_PATH=/etc/auth-demo/rsa_public.pem
+Environment=PEPPER_FILE=/etc/auth-demo/pepper
+Environment=NODE_ENV=production
+Environment=FILES_DIR=/var/lib/auth-demo/files
+
+# CentOS 7 用 glibc-217 的 Node 20 构建，见 centos7-node20.md
+ExecStart=/opt/node/bin/node --max-old-space-size=384 src/server.js
+
+Restart=always
+RestartSec=2
+TimeoutStopSec=30
+LimitNOFILE=65535
+
+# cgroup v1 内存上限（CentOS 7 不支持 MemoryMax/MemoryHigh）
+MemoryLimit=600M
+OOMScoreAdjust=-200
+
+# systemd 219 兼容：不使用 StateDirectory/LoadCredential/ProtectSystem=strict
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

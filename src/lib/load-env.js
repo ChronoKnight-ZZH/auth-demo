@@ -7,7 +7,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 function loadEnv(file) {
-  const p = file || path.join(process.cwd(), '.env');
+  // 生产 CLI 可用 ENV_FILE=/etc/auth-demo/env 复用 systemd 的环境文件
+  const p = file || process.env.ENV_FILE || path.join(process.cwd(), '.env');
   if (!fs.existsSync(p)) return false;
   const content = fs.readFileSync(p, 'utf8');
   for (const rawLine of content.split(/\r?\n/)) {

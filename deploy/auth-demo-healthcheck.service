@@ -1,0 +1,16 @@
+[Unit]
+Description=auth-demo healthcheck
+After=network-online.target auth-demo.service
+
+[Service]
+Type=oneshot
+User=authsvc
+Group=authsvc
+Environment=PATH=/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/auth-demo/deploy/healthcheck.sh
+# 可选：接入你的告警通道（邮件/企业微信/Prometheus Alertmanager）
+# OnFailure=auth-demo-alert@%n.service
+
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true

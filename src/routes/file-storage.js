@@ -189,7 +189,9 @@ function createFileRoutes({ fileRepo, chatRepo, authenticate }) {
     res.setHeader('X-Robots-Tag', 'noindex');
     // 下载不缓存；内联图片缓存 60s，删除会话后最多 1 分钟内仍可能命中浏览器缓存
     res.setHeader('Cache-Control', type === 'r' ? 'private, no-store' : 'private, max-age=60');
-    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    // 分域部署（chat.X 页面内嵌 api.X 图片）时 same-origin 会被 CORP 拦死；
+    // 由 FILES_CORP / CORS_ORIGINS 决定，见 config.files.corp
+    res.setHeader('Cross-Origin-Resource-Policy', config.files.corp);
     res.setHeader('ETag', `"${file.sha256}-${file.size}"`);
     res.setHeader('Accept-Ranges', 'bytes');
 

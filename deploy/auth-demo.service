@@ -1,6 +1,6 @@
 [Unit]
 Description=auth-demo API (Node.js)
-Documentation=https://example.invalid/auth-demo
+Documentation=https://chat.shunkai-dg.cn
 After=network-online.target mysqld.service redis.service
 Wants=network-online.target
 Requires=mysqld.service redis.service
@@ -10,6 +10,7 @@ Type=simple
 User=authsvc
 Group=authsvc
 WorkingDirectory=/opt/auth-demo
+UMask=0027
 
 # 环境变量：权限 600，属主 root:authsvc
 EnvironmentFile=/etc/auth-demo/env
@@ -23,14 +24,17 @@ LoadCredential=pepper:/etc/auth-demo/pepper
 Environment=RSA_PRIVATE_KEY_PATH=%d/rsa_private.pem
 Environment=RSA_PUBLIC_KEY_PATH=%d/rsa_public.pem
 Environment=PEPPER_FILE=%d/pepper
+Environment=NODE_ENV=production
 
-# 默认用 yum 安装的 node；CentOS 7（glibc 2.17）请改用 unofficial-builds 的
+# 默认用 yum/apt 安装的 node；CentOS 7（glibc 2.17）请改用 unofficial-builds 的
 # glibc-217 构建（本项目需要 Node 18+ 的 fetch/Web Streams），见 centos7-node20.md：
 # ExecStart=/opt/node/bin/node --max-old-space-size=384 src/server.js
 ExecStart=/usr/bin/node --max-old-space-size=384 src/server.js
 
 Restart=always
 RestartSec=2
+TimeoutStopSec=30
+LimitNOFILE=65535
 
 # 附件原件目录：StateDirectory 由 systemd 创建并授权给服务用户
 StateDirectory=auth-demo
@@ -47,7 +51,6 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/auth-demo/.runtime
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]

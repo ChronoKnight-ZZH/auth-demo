@@ -59,9 +59,41 @@ class MemoryUserRepo extends UserRepo {
           credential_version: 1,
           argon2_key_version: 1,
           status: 'active',
+          created_at: Date.now(),
         });
       }
     }
+  }
+
+  async createUser({ username, passwordHash }) {
+    if (this.users.has(username)) {
+      const error = new Error('duplicate username');
+      error.code = 'ER_DUP_ENTRY';
+      throw error;
+    }
+    const user = {
+      id: this.nextId++,
+      username,
+      password_hash: passwordHash,
+      credential_version: 1,
+      argon2_key_version: 1,
+      status: 'active',
+      created_at: Date.now(),
+    };
+    this.users.set(username, user);
+    return { ...user };
+  }
+
+  async listUsers() {
+    return [...this.users.values()]
+      .sort((a, b) => a.id - b.id)
+      .map((user) => ({
+        id: user.id,
+        username: user.username,
+        status: user.status,
+        credentialVersion: user.credential_version,
+        createdAt: user.created_at,
+      }));
   }
 
   /** 演示用：直接改状态，供 A-E-08 验收 */
@@ -70,6 +102,16 @@ class MemoryUserRepo extends UserRepo {
       if (u.id === Number(userId)) { u.status = status; return true; }
     }
     return false;
+  }
+
+  async revokeCredentials(userId) {
+    for (const u of this.users.values()) {
+      if (u.id === Number(userId)) {
+        u.credential_version += 1;
+        return u.credential_version;
+      }
+    }
+    return null;
   }
 
   async close() {}

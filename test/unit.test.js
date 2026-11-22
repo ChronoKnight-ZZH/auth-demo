@@ -28,6 +28,15 @@ const { config } = require('../src/config');
 const fileToken = require('../src/files/token');
 const mimeSniff = require('../src/files/mime');
 const blobStore = require('../src/files/blob-store');
+const { ZipArchive } = require('../src/import/zip-reader');
+const {
+  readSessionFile,
+  toLocalSession,
+  checkManifest,
+} = require('../src/import/history');
+const { importArchive } = require('../src/import/import-history');
+const { createAdminService } = require('../src/account/admin-service');
+const { makeZip } = require('./helpers/zip');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -386,5 +395,393 @@ test('原件存储：流式写入、内容寻址、去重与 Range 解析', asyn
   } finally {
     config.files.dir = originalDir;
     await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+const PNG_1X1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64'
+);
+const ISO = '2026-11-22T00:00:00.000Z';
+
+function sessionArchive(sessionId = 'sess-00000001') {
+  const imageFile = {
+    id: 'file-image-1',
+    file_name: '图片.png',
+    file_size: PNG_1X1.length,
+    token_usage: null,
+    inserted_at: ISO,
+    export_path: `chat_sessions/${sessionId}_files/file-image-1_图片.png`,
+    is_image: true,
+    width: 1,
+    height: 1,
+  };
+  const textFile = {
+    id: 'file-text-1',
+    file_name: '说明.txt',
+    file_size: 5,
+    token_usage: null,
+    inserted_at: ISO,
+    export_path: null,
+    is_image: false,
+    width: null,
+    height: null,
+  };
+  const userMessage = (id, parentId, content, files) => ({
+    id,
+    parent_id: parentId,
+    role: 'USER',
+    status: 'FINISHED',
+    thinking_enabled: false,
+    search_enabled: true,
+    accumulated_token_usage: 0,
+    inserted_at: ISO,
+    fragments: [
+      { type: 'REQUEST', content },
+      ...(files ? [{ type: 'FILE', files }] : []),
+    ],
+  });
+  const assistantMessage = (id, parentId, fragments, status = 'FINISHED') => ({
+    id,
+    parent_id: parentId,
+    role: 'ASSISTANT',
+    status,
+    thinking_enabled: true,
+    search_enabled: true,
+    accumulated_token_usage: 10,
+    inserted_at: ISO,
+    fragments,
+  });
+  const session = {
+    id: sessionId,
+    title: '导入会话',
+    pinned: false,
+    current_message_id: 4,
+    inserted_at: ISO,
+    updated_at: ISO,
+    messages: [
+      userMessage(1, null, '请分析图片', [imageFile, textFile]),
+      assistantMessage(2, 1, [
+        { type: 'THINK', content: '思考过程', elapsed_secs: 1.5 },
+        { type: 'RESPONSE', content: '回答正文' },
+        {
+          type: 'TOOL_SEARCH',
+          queries: ['query'],
+          results: [
+            {
+              url: 'https://example.com',
+              title: '示例',
+              snippet: '摘要',
+              published_at: null,
+              site_name: null,
+            },
+          ],
+          status: 'FINISHED',
+        },
+        {
+          type: 'READ_LINK',
+          results: [{ url: 'https://example.com/a', title: 'A', signature: 'sig-1' }],
+        },
+      ]),
+      userMessage(3, 2, '继续追问'),
+      assistantMessage(4, 3, [{ type: 'RESPONSE', content: '回答正文 2' }]),
+      userMessage(5, 2, '另一个分支'),
+      assistantMessage(6, 5, [{ type: 'RESPONSE', content: '分支回答' }]),
+    ],
+  };
+  const index = [
+    {
+      id: sessionId,
+      title: session.title,
+      pinned: false,
+      message_count: session.messages.length,
+      inserted_at: ISO,
+      updated_at: ISO,
+    },
+  ];
+  return { session, index, imageFile, imagePath: imageFile.export_path };
+}
+
+function buildZip({ sessionId } = {}) {
+  const { session, index, imagePath } = sessionArchive(sessionId);
+  return makeZip([
+    { name: 'manifest.json', data: JSON.stringify({ export_format_version: 3 }) },
+    { name: `chat_sessions/${session.id}.json`, data: JSON.stringify(session) },
+    { name: 'chat_session_index.json', data: JSON.stringify(index) },
+    { name: imagePath, data: PNG_1X1, deflate: true },
+  ]);
+}
+
+test('ZIP 解析：STORE/DEFLATE、UTF-8 路径与 CRC', () => {
+  const zip = makeZip([
+    { name: 'manifest.json', data: '{"export_format_version":3}' },
+    { name: '目录/说明.txt', data: 'hello', deflate: true },
+  ]);
+  const archive = new ZipArchive(zip);
+  assert.strictEqual(archive.firstPath, 'manifest.json');
+  assert.strictEqual(archive.read('manifest.json').toString(), '{"export_format_version":3}');
+  assert.strictEqual(archive.read('目录/说明.txt').toString(), 'hello');
+
+  assert.throws(
+    () => new ZipArchive(makeZip([{ name: '../evil', data: 'x' }])),
+    /Invalid history archive/
+  );
+  assert.throws(
+    () => new ZipArchive(makeZip([{ name: '/absolute', data: 'x' }])),
+    /Invalid history archive/
+  );
+
+  const corrupt = makeZip([{ name: 'a.txt', data: 'hello' }]);
+  // 本地头 30 字节 + 文件名 5 字节，数据从第 35 字节开始
+  corrupt[35] ^= 0xff;
+  const corruptArchive = new ZipArchive(corrupt);
+  assert.throws(() => corruptArchive.read('a.txt'), /CRC/);
+});
+
+test('历史归档转换：分支、思考、搜索、阅读链接与附件', () => {
+  const { session: raw, imagePath } = sessionArchive();
+  const file = readSessionFile(raw);
+  const resolved = new Map([
+    [
+      'file-image-1',
+      { storageId: 'stored-image-1', mime: 'image/png', isImage: true },
+    ],
+  ]);
+  const { session, images } = toLocalSession(file, resolved);
+
+  assert.strictEqual(session.id, 'sess-00000001');
+  assert.strictEqual(session.title, '导入会话');
+  assert.strictEqual(session.rootMessageId, '1');
+  assert.strictEqual(session.messages.length, 6);
+  assert.strictEqual(session.messages[0].selectedChildId, '2');
+  assert.strictEqual(session.messages[1].selectedChildId, '3');
+  assert.strictEqual(session.messages[2].selectedChildId, '4');
+
+  const user = session.messages[0];
+  assert.strictEqual(user.content, '请分析图片');
+  assert.strictEqual(user.files.length, 2);
+  assert.deepStrictEqual(user.files[0], {
+    id: 'file-image-1',
+    serverId: null,
+    storageId: 'stored-image-1',
+    name: '图片.png',
+    size: PNG_1X1.length,
+    isImage: true,
+    mimeType: 'image/png',
+  });
+  assert.strictEqual(user.files[1].storageId, null);
+  assert.strictEqual(user.files[1].isImage, false);
+
+  const assistant = session.messages[1];
+  const types = assistant.blocks.map((block) => block.type);
+  assert.ok(types.includes('thinking'));
+  assert.ok(types.includes('text'));
+  assert.ok(types.includes('server_tool_use'));
+  assert.ok(types.includes('web_search_tool_result'));
+  assert.ok(types.includes('web_fetch_tool_result'));
+  const fetchBlock = assistant.blocks.find(
+    (block) => block.type === 'web_fetch_tool_result' && block.signature
+  );
+  assert.strictEqual(fetchBlock.signature, 'sig-1');
+  assert.ok(images.has('file-image-1'));
+  assert.strictEqual(images.get('file-image-1').path, imagePath);
+
+  // 同角色父子关系必须拒绝
+  const broken = JSON.parse(JSON.stringify(raw));
+  broken.messages[3].parent_id = 2;
+  const brokenFile = readSessionFile(broken);
+  assert.throws(() => toLocalSession(brokenFile), /消息树/);
+
+  // 图片路径不能跨会话
+  const crossed = JSON.parse(JSON.stringify(raw));
+  crossed.messages[0].fragments[1].files[0].export_path =
+    'chat_sessions/other-files/file-image-1_图片.png';
+  assert.throws(() => toLocalSession(readSessionFile(crossed)), /图片路径/);
+
+  // 新版本归档直接拒绝
+  assert.throws(() => checkManifest({ export_format_version: 4 }), /版本/);
+});
+
+test('历史导入核心：图片归档、引用同步、幂等与 dry-run', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'auth-import-'));
+  const originalDir = config.files.dir;
+  config.files.dir = dir;
+  const chatRepo = new MemoryChatRepo();
+  const fileRepo = new MemoryFileRepo();
+  const user = { id: 1, username: 'alice' };
+  try {
+    const zip = buildZip();
+    const first = await importArchive({
+      user,
+      actor: 'test',
+      source: 'fixture.zip',
+      archiveBuffer: zip,
+      chatRepo,
+      fileRepo,
+    });
+    assert.strictEqual(first.sessionsTotal, 1);
+    assert.strictEqual(first.sessionsImported, 1);
+    assert.strictEqual(first.sessionsSkipped, 0);
+    assert.strictEqual(first.filesImported, 1);
+
+    const session = await chatRepo.getSession(1, 'sess-00000001');
+    assert.ok(session);
+    const attachment = session.messages[0].files[0];
+    assert.ok(attachment.storageId);
+    assert.strictEqual(attachment.mimeType, 'image/png');
+    assert.strictEqual(attachment.isImage, true);
+
+    const stored = await fileRepo.get(1, attachment.storageId);
+    assert.strictEqual(stored.name, '图片.png');
+    assert.strictEqual(stored.mime, 'image/png');
+    assert.strictEqual(stored.isImage, true);
+    assert.ok(await blobStore.stat(stored.storageKey));
+    assert.deepStrictEqual(fileRepo.listRefs(1, 'sess-00000001'), [attachment.storageId]);
+
+    // 重复导入：跳过已有会话，不新增文件/会话
+    const second = await importArchive({
+      user,
+      actor: 'test',
+      source: 'fixture.zip',
+      archiveBuffer: zip,
+      chatRepo,
+      fileRepo,
+    });
+    assert.strictEqual(second.sessionsImported, 0);
+    assert.strictEqual(second.sessionsSkipped, 1);
+    assert.strictEqual(second.filesImported, 0);
+
+    // dry-run：新会话只校验，不落库；也不写审计
+    const audit = {
+      starts: 0,
+      finishes: [],
+      async start() {
+        this.starts += 1;
+        return 1;
+      },
+      async finish(_id, patch) {
+        this.finishes.push(patch);
+      },
+    };
+    const dry = await importArchive({
+      user,
+      actor: 'test',
+      source: 'fixture.zip',
+      archiveBuffer: buildZip({ sessionId: 'sess-00000002' }),
+      dryRun: true,
+      chatRepo,
+      fileRepo,
+      auditRepo: audit,
+    });
+    assert.strictEqual(dry.sessionsImported, 1);
+    assert.strictEqual(await chatRepo.hasSession(1, 'sess-00000002'), false);
+    assert.strictEqual(audit.starts, 0);
+
+    // 正式导入写审计：start → success finish
+    await importArchive({
+      user,
+      actor: 'test',
+      source: 'fixture.zip',
+      archiveBuffer: buildZip({ sessionId: 'sess-00000005' }),
+      chatRepo,
+      fileRepo,
+      auditRepo: audit,
+    });
+    assert.strictEqual(audit.starts, 1);
+    assert.strictEqual(audit.finishes.length, 1);
+    assert.strictEqual(audit.finishes[0].status, 'success');
+    assert.strictEqual(audit.finishes[0].sessionsImported, 1);
+
+    // 预校验失败时不写任何会话（第二会话消息树非法）
+    const good = sessionArchive('sess-00000003').session;
+    const bad = JSON.parse(JSON.stringify(sessionArchive('sess-00000004').session));
+    bad.messages[3].parent_id = 2;
+    const badZip = makeZip([
+      { name: 'manifest.json', data: JSON.stringify({ export_format_version: 3 }) },
+      { name: `chat_sessions/${good.id}.json`, data: JSON.stringify(good) },
+      { name: `chat_sessions/${bad.id}.json`, data: JSON.stringify(bad) },
+      {
+        name: 'chat_session_index.json',
+        data: JSON.stringify([
+          { ...sessionArchive(good.id).index[0] },
+          { ...sessionArchive(bad.id).index[0] },
+        ]),
+      },
+    ]);
+    await assert.rejects(
+      importArchive({
+        user,
+        actor: 'test',
+        source: 'bad.zip',
+        archiveBuffer: badZip,
+        chatRepo,
+        fileRepo,
+      }),
+      /消息树/
+    );
+    assert.strictEqual(await chatRepo.hasSession(1, 'sess-00000003'), false);
+    assert.strictEqual(await chatRepo.hasSession(1, 'sess-00000004'), false);
+
+    // replace：覆盖同 id 会话
+    const replace = await importArchive({
+      user,
+      actor: 'test',
+      source: 'fixture.zip',
+      archiveBuffer: zip,
+      mode: 'replace',
+      chatRepo,
+      fileRepo,
+    });
+    assert.strictEqual(replace.sessionsImported, 1);
+    assert.strictEqual(replace.sessionsSkipped, 0);
+  } finally {
+    config.files.dir = originalDir;
+    await chatRepo.close();
+    await fileRepo.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('管理员账号：创建、锁定、解锁与重置密码', async () => {
+  const userRepo = new MemoryUserRepo();
+  const sessionStore = new MemorySessionStore();
+  const service = createAdminService({ userRepo, sessionStore });
+  try {
+    const created = await service.createUser({ username: 'carol', password: 'Passw0rd!' });
+    assert.strictEqual(created.username, 'carol');
+    assert.strictEqual(created.status, 'active');
+
+    await assert.rejects(
+      service.createUser({ username: 'carol', password: 'Passw0rd!' }),
+      (error) => error.code === 'ER_DUP_ENTRY'
+    );
+    await assert.rejects(
+      service.createUser({ username: 'dave', password: 'short' }),
+      /至少 8 个字符/
+    );
+
+    const locked = await service.lockUser('carol');
+    assert.strictEqual(locked.changed, true);
+    let user = await userRepo.findByUsername('carol');
+    assert.strictEqual(user.status, 'locked');
+    assert.strictEqual(user.credential_version, 2);
+    assert.strictEqual(await sessionStore.getCredVersion(user.id), 2);
+
+    const unlocked = await service.unlockUser('carol');
+    assert.strictEqual(unlocked.changed, true);
+    user = await userRepo.findByUsername('carol');
+    assert.strictEqual(user.status, 'active');
+
+    const reset = await service.resetPassword('carol', 'NewPassw0rd!');
+    assert.strictEqual(reset.credentialVersion, 3);
+    user = await userRepo.findByUsername('carol');
+    assert.strictEqual(await verifyPassword(user.password_hash, 'NewPassw0rd!'), true);
+    assert.strictEqual(await verifyPassword(user.password_hash, 'Passw0rd!'), false);
+    assert.strictEqual(await sessionStore.getCredVersion(user.id), 3);
+
+    await assert.rejects(service.lockUser('nobody'), /用户不存在/);
+  } finally {
+    await sessionStore.close();
+    await userRepo.close();
   }
 });

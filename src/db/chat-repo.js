@@ -11,7 +11,11 @@ class ChatRepo {
   async listSessions(userId) { throw new Error('not implemented'); }
   async listAllSessions(userId) { throw new Error('not implemented'); }
   async getSession(userId, id) { throw new Error('not implemented'); }
+  /** 会话是否存在（含已软删除），供导入幂等判断 */
+  async hasSession(userId, id) { throw new Error('not implemented'); }
   async saveSession(userId, session) { throw new Error('not implemented'); }
+  /** 物理删除会话，仅导入回滚/覆盖使用；调用方需自行清理附件引用 */
+  async purgeSession(userId, id) { throw new Error('not implemented'); }
   async renameSession(userId, id, title) { throw new Error('not implemented'); }
   async deleteSession(userId, id) { throw new Error('not implemented'); }
   async clearSessions(userId) { throw new Error('not implemented'); }

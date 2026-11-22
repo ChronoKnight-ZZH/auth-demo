@@ -106,6 +106,37 @@ node src/server.js
 > `node_modules` 中的 `.node` 二进制；`mysql2`、`ioredis` 也存在动态加载路径，
 > 直接复制运行文件更可靠。若后续要容器化，可在 `dist/` 之上加 Dockerfile。
 
+## 容器化运行（生产）
+
+`docker-compose.yml` 编排的是 **MySQL 8.4 + Redis 7.2**。应用本身在服务器上以容器运行
+（镜像由 `dist/` 产物 + `argon2` 原生模块构建）。容器内需保证：
+
+| 变量 | 容器取值 | 说明 |
+| --- | --- | --- |
+| `HOST` | `0.0.0.0` | 默认 `127.0.0.1` 只监听回环，同容器网络里的 Nginx / 端口映射进不去 |
+| `MYSQL_URL` | `mysql://authdemo:authdemo_pw@mysql:3306/auth_demo` | 用 compose 服务名，而不是 `127.0.0.1` |
+| `REDIS_URL` | `redis://:authdemo_redis_pw@redis:6379/0` | 同上 |
+| `PEPPER` / `RSA_*_PATH` | Secret 挂载 | 不落镜像层；见 `auth-demo.service` 的 `LoadCredential` |
+| `FILES_DIR` | `/data/files`（挂 volume） | 默认写仓库内 `data/files`，容器重建即丢原件 |
+| `CORS_ORIGINS` | 见下 | 仅前后端分域时需要 |
+
+### 跨域（CORS）
+
+后端鉴权用 **Opaque Bearer Token，不使用 Cookie**，因此没有 SameSite 跨站问题。是否下发
+CORS 头由 `CORS_ORIGINS` 单一开关决定（`src/middleware/cors.js`）：
+
+- **同源反代**（前端 Nginx 把 `/auth`、`/v1` 转发到本站）：`CORS_ORIGINS` 留空，中间件
+  完全直通，行为与加它之前逐字节一致。这是 `deploy/nginx-auth-demo.conf` 的设计。
+- **分域直连**（前端 `chat.shunkai-dg.cn` 直接请求 `api.shunkai-dg.cn`）：必须设
+  `CORS_ORIGINS=https://chat.shunkai-dg.cn`（逗号分隔多个来源）。命中白名单时回显具体来源
+  `Access-Control-Allow-Origin` + `Allow-Credentials: true`，放行预检头 `Authorization`、
+  `Content-Type`、`Accept`、`X-Request-Id`、`X-File-Name`、`X-File-Mime`；非白名单来源预检
+  返回 403。`*` 会反射任意来源（无 Cookie 故无 CSRF 会话风险，但生产建议显式列白名单）。
+
+> `chat-demo` 前端生产默认就是**分域直连** `api.shunkai-dg.cn`（`credentials: include`），
+> 所以线上后端记得配 `CORS_ORIGINS`，否则登录/聊天/上传会被浏览器全部拦截。
+> 若改用同源反代，则把前端按 `BFF_BASE=/v1`、`AUTH_BASE=/auth` 重新构建，后端留空。
+
 ## 切换到 MySQL 8.4 + Redis
 
 ```bash
@@ -209,6 +240,49 @@ DEDUPE_SCOPE=global              # global | user
 > 缩略图生成、病毒扫描、物理块 GC 均未实现：软删除只影响元数据，已上传的 blob
 > 需后续离线清理任务回收。文件预览当前只支持图片（浏览器内弹窗），文档只提供下载。
 
+## 账号管理（CLI）
+
+不开放注册，账号只能由管理员在服务器上创建。需要 `MYSQL_URL`；锁定和重置密码
+会递增凭证版本并写穿 Redis，使该用户全部旧 Token 立即失效。
+
+```bash
+npm run user:list
+npm run user:create -- --username alice          # 交互输入密码（推荐）
+npm run user:create -- --username alice --password 'Passw0rd!'   # 自动化/脚本
+npm run user:lock -- --username alice
+npm run user:unlock -- --username alice
+npm run user:reset-password -- --username alice  # 交互输入新密码
+```
+
+规则：用户名最多 64 字符；密码至少 8 个字符；用户名与密码的 UTF-8 总长度不超过
+180 字节（登录 RSA-OAEP 明文上限 190 字节）。`--password` 会进入 shell 历史，
+生产建议交互输入或从受控脚本注入。
+
+## 历史导入（CLI）
+
+浏览器端不提供导入，只能由管理员在服务器上导入 chat-demo 导出的
+`deepseek_data-*.zip`（`export_format_version = 3`）：
+
+```bash
+npm run import:history -- --user alice --file /data/backup/deepseek_data-2026-11-22.zip
+npm run import:history -- --user alice --file backup.zip --dry-run
+npm run import:history -- --user alice --file backup.zip --replace
+```
+
+- `--dry-run`：完整校验 ZIP、消息树、图片路径与大小，只输出统计，不写库/磁盘。
+- 默认**跳过已存在的会话 id**，重复导入同一 ZIP 不会产生重复会话；`--replace`
+  会先物理删除同 id 会话再写入（不跨会话事务，失败时已替换的旧内容无法恢复）。
+- 图片按会话目录写入服务端原件存储，并直接写入 `files[].storageId`；其他附件
+  归档里只有元数据，导入后仍只显示文件卡片。
+- 导入的图片首次进入新请求时，前端会从 BFF 取回原件再上传上游 Files API，
+  不需要浏览器重新选择文件。
+- 每次正式导入写入 `import_jobs`：执行者（OS 账号）、来源文件名、ZIP sha256、
+  会话/图片统计、成功/失败原因；`--dry-run` 不写审计。失败在预校验阶段不会写入任何会话。
+- 导入直接写库，不会通知在线页面；建议在用户离线时执行，`--replace` 尤其要避免与
+  用户编辑同一会话并发。
+- 限制：ZIP ≤ 256 MiB、解压总量默认 512 MiB（`--max-mb` 可调）、单条会话 JSON
+  ≤ 8 MiB；不支持 ZIP64、加密 ZIP 与符号链接。
+
 ## 错误码
 
 | code | HTTP | 含义 |
@@ -277,7 +351,7 @@ npm run smoke:echo     # 复读机 × 中转链路 端到端 19 项（自起服�
 ## 测试与验收
 
 ```bash
-npm test                  # 单元测试（21 项）
+npm test                  # 单元测试（25 项）
 npm run test:echo         # 本地复读机上游单测（12 项，零依赖）
 npm run smoke             # 端到端冒烟（需服务已启动，16 项）
 npm run smoke:stream      # 中转链路端到端（自起 mock 上游）
@@ -317,13 +391,18 @@ npm run verify:all        # 串行执行以上全部
 
 ### 手动验证 A-E-08（锁定生效）
 
-内存模式下可通过调试接口或直接改代码触发；MySQL 模式：
+推荐直接用 CLI；它会递增凭证版本并写穿 Redis，立即撤销旧会话：
 
-```sql
-UPDATE users SET status='locked' WHERE username='alice';
+```bash
+npm run user:lock -- --username alice
 ```
 
-随后用锁定前的有效 Token 调 `/auth/me`，应返回 `403 ACCOUNT_LOCKED`。
+若只执行 SQL `UPDATE users SET status='locked'`，数据库中状态会更新，但已经签发的
+会话仍保留登录时的状态快照；需要同时递增 `credential_version` 并写穿 Redis
+（或让用户重新登录）才会立即生效。
+
+随后用锁定前的有效 Token 调 `/auth/me`，应返回 `401 TOKEN_INVALID`（版本失效）；
+锁定后重新登录则返回 `403 ACCOUNT_LOCKED`。
 
 ## 目录结构
 
@@ -345,11 +424,17 @@ auth-demo/
 │   │   ├── memory-chat-repo.js # 会话内存实现
 │   │   ├── file-repo.js        # 原件元数据接口
 │   │   ├── mysql-file-repo.js  # 原件 MySQL 实现
-│   │   └── memory-file-repo.js # 原件内存实现
+│   │   ├── memory-file-repo.js # 原件内存实现
+│   │   └── audit-repo.js       # import_jobs 审计
 │   ├── files/
 │   │   ├── blob-store.js       # 内容寻址、原子落盘、Range
 │   │   ├── mime.js             # 文件头嗅探与安全降级
 │   │   └── token.js            # HMAC 访问票据
+│   ├── import/
+│   │   ├── zip-reader.js       # 只读 ZIP32（STORE/DEFLATE、CRC）
+│   │   ├── history.js          # 归档校验与本地 Session 转换
+│   │   └── import-history.js   # 导入事务、图片归档、幂等/回滚
+│   ├── account/admin-service.js # 账号创建/锁定/解锁/重置密码
 │   ├── session/
 │   │   ├── token.js            # Token 生成与哈希
 │   │   ├── store.js            # 接口（revokeAll = 版本失效）
@@ -366,87 +451,71 @@ auth-demo/
 ├── migrations/
 │   ├── 001_init.sql            # users
 │   ├── 002_chat.sql            # chat_sessions
-│   └── 003_files.sql           # app_files / app_file_refs
+│   ├── 003_files.sql           # app_files / app_file_refs
+│   └── 004_import.sql          # import_jobs 审计
 ├── data/files/                 # 本地原件目录（已 gitignore，生产另行挂载）
-├── scripts/                    # 密钥、迁移、种子、冒烟、验证、构建
-├── test/unit.test.js
+├── scripts/                    # 密钥、迁移、种子、admin、import、冒烟、验证、构建
+├── test/unit.test.js + helpers # 单元测试与 ZIP 夹具
 ├── deploy/                     # systemd、Nginx
 ├── docker-compose.yml
 └── public/index.html
 ```
 
-## 生产部署（CentOS Stream 9）
+## 生产部署
 
-> **CentOS 7(glibc 2.17)只能 yum 装 Node 16,而本项目 `/v1` 中转需要 Node 18+ 的 fetch/Web Streams。**
-> 免改代码的做法是安装 unofficial-builds 的 `linux-x64-glibc-217` 专用构建并让 systemd 指向它,
-> 步骤与校验要求见 [deploy/centos7-node20.md](deploy/centos7-node20.md)。
+完整步骤、验收、备份恢复与回滚见 [deploy/DEPLOY.md](deploy/DEPLOY.md)。当前推荐拓扑是分域直连：
+
+```text
+chat.shunkai-dg.cn  静态前端（chat-demo/dist）
+api.shunkai-dg.cn   auth-demo → MySQL + Redis + /var/lib/auth-demo/files
+```
+
+生产配置文件：
+
+| 文件 | 用途 |
+| --- | --- |
+| `deploy/env.production.example` | `/etc/auth-demo/env` 模板（CORS、MySQL、Redis、上游 Key、文件票据） |
+| `deploy/auth-demo.service` | systemd 单元（systemd ≥244，LoadCredential/StateDirectory） |
+| `deploy/auth-demo-centos7.service` | CentOS 7（systemd 219）兼容单元 |
+| `deploy/nginx-api.conf` / `nginx-api-http.conf` | API 域名反代（正式 TLS / 首次签发 HTTP-only） |
+| `deploy/mysql-auth.cnf` / `deploy/redis-auth.conf` | 2C4G 单机基线 |
+| `deploy/auth-demo-backup.service` / `.timer` | 每日 MySQL + 附件备份 |
+| `deploy/auth-demo-healthcheck.service` / `.timer` | 5 分钟健康检查 |
+| `deploy/healthcheck.sh` / `deploy/verify-production.sh` | 健康检查与上线验收 |
+| `chat-demo/deploy/nginx-chat.conf` / `nginx-chat-http.conf` | 前端静态站点（正式 TLS / 首次签发 HTTP-only） |
+
+最短上线路径：
 
 ```bash
-# 1) 依赖
-dnf module install -y nodejs:22
-dnf module install -y mysql:8.4
-dnf module install -y redis:7.2
-dnf install -y nginx certbot python3-certbot-nginx
-dnf groupinstall -y "Development Tools" && dnf install -y python3   # argon2 可能需源码编译
+# 构建（本地/构建机）
+cd auth-demo && npm ci && npm run build
+cd chat-demo && npm ci && npm run build
 
-# 2) 目录与用户
-useradd -r -s /sbin/nologin authsvc
-mkdir -p /opt/auth-demo /etc/auth-demo
-chown -R authsvc:authsvc /opt/auth-demo
-
-# 3) 密钥与 pepper（用 systemd LoadCredential 注入）
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /etc/auth-demo/rsa_private.pem
-openssl pkey -in /etc/auth-demo/rsa_private.pem -pubout -out /etc/auth-demo/rsa_public.pem
-openssl rand -base64 48 > /etc/auth-demo/pepper
-chmod 600 /etc/auth-demo/rsa_private.pem /etc/auth-demo/pepper
-chown root:authsvc /etc/auth-demo/*.pem /etc/auth-demo/pepper
-
-# 4) 部署单元
-cp deploy/auth-demo.service /etc/systemd/system/
-cp deploy/nginx-auth-demo.conf /etc/nginx/conf.d/
-setsebool -P httpd_can_network_connect 1        # SELinux：允许 Nginx 反代
-firewall-cmd --permanent --add-service={http,https}
-firewall-cmd --reload
-
-# 5) 证书
-certbot --nginx -d auth.example.com --agree-tos -m ops@example.com --redirect
-
-# 6) 启动
-systemctl daemon-reload
+# 服务器：解包 → npm ci --omit=dev → 填 /etc/auth-demo/env → 迁移 → systemd
+# CentOS 7 用 deploy/auth-demo-centos7.service；Stream 9 用 deploy/auth-demo.service
+ENV_FILE=/etc/auth-demo/env /opt/node/bin/node scripts/migrate.js
+ENV_FILE=/etc/auth-demo/env /opt/node/bin/node scripts/admin.js create --username admin
 systemctl enable --now auth-demo nginx mysqld redis
-systemctl status auth-demo
+
+# 证书
+certbot --nginx -d chat.shunkai-dg.cn -d api.shunkai-dg.cn \
+  --agree-tos -m ops@example.com --redirect
+
+# 备份与健康检查
+systemctl enable --now auth-demo-backup.timer auth-demo-healthcheck.timer
 ```
+
+> **CentOS 7(glibc 2.17)**：yum 只有 Node 16，而 `/v1` 需要 Node 18+ 的 fetch/Web Streams。
+> 使用 unofficial-builds 的 `linux-x64-glibc-217` 构建，并把 systemd 的 `ExecStart`
+> 改为 `/opt/node/bin/node`；步骤与校验见 [deploy/centos7-node20.md](deploy/centos7-node20.md)。
 
 ### 关键运维配置（勿遗漏）
 
-Redis（`/etc/redis/redis.conf`）：
-
-```
-bind 127.0.0.1
-requirepass <强随机值>
-maxmemory 256mb
-maxmemory-policy noeviction     # 会话是数据不是缓存
-appendonly yes
-```
-
-MySQL（`/etc/my.cnf.d/auth.cnf`）：
-
-```
-[mysqld]
-bind-address=127.0.0.1
-innodb_buffer_pool_size=512M
-performance_schema=OFF
-```
-
-备份：
-
-```bash
-mysqldump --single-transaction --routines --triggers auth_demo \
-  | gzip > /var/backups/auth-$(date +%F).sql.gz
-# 附件原件与数据库元数据必须一起备份
-tar czf /var/backups/auth-files-$(date +%F).tar.gz -C /var/lib/auth-demo files
-# 必须同步到机外
-```
+- MySQL/Redis 只监听 `127.0.0.1`；Redis `maxmemory-policy noeviction` + AOF。
+- `CORS_ORIGINS=https://chat.shunkai-dg.cn`；分域同站点时 `FILES_CORP=same-site`。
+- `.env`/RSA 私钥/pepper 权限 600；上游 Key 只在服务器。
+- 备份必须同时包含 MySQL 与 `/var/lib/auth-demo/files/blobs`，并复制到机外。
+- 健康检查与 `verify-production.sh` 纳入上线验收。
 
 ## 安全注意事项
 
@@ -463,4 +532,6 @@ tar czf /var/backups/auth-files-$(date +%F).tar.gz -C /var/lib/auth-demo files
 - 单机单实例，无 Sentinel/Cluster。
 - 附件原件为**单机本地磁盘**：多实例部署前需换成共享存储；软删除不做物理 GC，也没有缩略图、病毒扫描与文档预览。
 - 服务端只保存原件与元数据；浏览器 IndexedDB 仍是首屏显示与离线写入的缓存，删除会话不会删除已上传的原件元数据（仅解除引用）。
+- 历史导入只归档 ZIP 内的图片；非图片附件在归档里本来只有元数据。导入过程不是跨会话事务：`--replace` 失败时已替换的会话无法恢复，极端情况下（DB 写入后崩溃）可能留下无元数据的 blob。
+- ZIP 会整体读入内存，默认上限 256 MiB；更大的历史需要先拆分归档或后续改成流式读取。
 - 本机实测环境为 Windows + Node 20；**目标环境 CentOS Stream 9 + Node 22 的构建与压测未执行**。

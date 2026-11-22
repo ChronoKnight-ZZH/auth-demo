@@ -1,0 +1,24 @@
+# /etc/my.cnf.d/auth.cnf —— 2C4G 单机基线
+# 修改后 systemctl restart mysqld；首次部署前先跑 migrations。
+[mysqld]
+bind-address=127.0.0.1
+skip-name-resolve=ON
+character-set-server=utf8mb4
+collation-server=utf8mb4_unicode_ci
+
+# 2C4G：给 MySQL 约 512M，余量留给 Node/Redis/系统
+innodb_buffer_pool_size=512M
+innodb_log_file_size=128M
+performance_schema=OFF
+max_connections=64
+
+# 会话 JSON 单条上限 8MB，预留余量；附件本体不存 MySQL
+max_allowed_packet=64M
+
+local_infile=OFF
+symbolic-links=OFF
+
+# 慢查询留痕，便于上线后压测
+slow_query_log=ON
+long_query_time=2
+slow_query_log_file=/var/log/mysql/slow.log

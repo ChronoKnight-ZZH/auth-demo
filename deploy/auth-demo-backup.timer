@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily auth-demo backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=300
+Persistent=true
+Unit=auth-demo-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -43,6 +43,17 @@ const config = {
   host: process.env.HOST || '127.0.0.1', // 方案 §6.5：只监听回环，由 Nginx 终结 TLS
   trustProxy: bool('TRUST_PROXY', true),
 
+  // ---- CORS（前后端分域部署才需要；同源 Nginx 反代保持留空）----
+  cors: {
+    /** 逗号分隔的来源白名单，如 https://chat.shunkai-dg.cn；`*` = 反射任意来源 */
+    origins: (process.env.CORS_ORIGINS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+    /** 预检结果缓存秒数 */
+    maxAgeSec: int('CORS_MAX_AGE_SEC', 600),
+  },
+
   // ---- RSA / OAEP（方案 §3.1、§6.2.1）----
   rsa: {
     padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
@@ -172,6 +183,20 @@ const config = {
     dedupeScope: process.env.DEDUPE_SCOPE === 'user' ? 'user' : 'global',
     /** 票据密钥标识，支持轮换 */
     keyId: process.env.FILE_TOKEN_KID || 'k1',
+    /**
+     * /files/content 的 Cross-Origin-Resource-Policy（<img> 能否跨源加载，独立于 CORS）。
+     * 留空时按部署形态自动选择：
+     *   - 分域直连（CORS_ORIGINS 非空）→ same-site：chat.X 可内嵌 api.X 图片（同 eTLD+1），
+     *     仍拦掉真正跨站的盗链。
+     *   - 同源反代（CORS_ORIGINS 为空）→ same-origin：与历史行为逐字节一致。
+     * 前端与后端不同「站点」（如 github.io 预览直连本站）时显式设 cross-origin。
+     */
+    corp: (() => {
+      const v = (process.env.FILES_CORP || '').trim();
+      if (v === 'same-origin' || v === 'same-site' || v === 'cross-origin') return v;
+      const hasCors = (process.env.CORS_ORIGINS || '').split(',').some((s) => s.trim());
+      return hasCors ? 'same-site' : 'same-origin';
+    })(),
   },
 
   // ---- 其他 ----
@@ -213,6 +238,11 @@ function configWarnings() {
   }
   if (config.files.mode === 'local' && !config.files.tokenSecret) {
     warnings.push('FILE_TOKEN_SECRET 未设置 —— 文件票据将使用 PEPPER 派生密钥，生产环境请显式配置');
+  }
+  if (config.env === 'production' && config.cors.origins.length === 0) {
+    warnings.push(
+      'CORS_ORIGINS 未设置 —— 按同源反代部署运行；若前端在别的域名直连本站，跨域请求会被浏览器拦截'
+    );
   }
   return warnings;
 }

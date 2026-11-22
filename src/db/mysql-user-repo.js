@@ -89,6 +89,67 @@ class MysqlUserRepo extends UserRepo {
     }
   }
 
+  async createUser({ username, passwordHash }) {
+    const [r] = await this.pool.execute(
+      `INSERT INTO users (username, password_hash, credential_version, argon2_key_version, status)
+       VALUES (?, ?, 1, 1, 'active')`,
+      [username, passwordHash]
+    );
+    return this.findById(r.insertId);
+  }
+
+  async listUsers() {
+    const [rows] = await this.pool.query(
+      `SELECT id, username, status, credential_version, created_at
+         FROM users
+        ORDER BY id ASC`
+    );
+    return rows.map((row) => ({
+      id: Number(row.id),
+      username: row.username,
+      status: row.status,
+      credentialVersion: Number(row.credential_version),
+      createdAt: row.created_at instanceof Date ? row.created_at.getTime() : Number(row.created_at),
+    }));
+  }
+
+  async setStatus(userId, status) {
+    if (status !== 'active' && status !== 'locked') {
+      throw new Error('invalid user status');
+    }
+    const [r] = await this.pool.execute(
+      'UPDATE users SET status = ? WHERE id = ?',
+      [status, userId]
+    );
+    return r.affectedRows === 1;
+  }
+
+  /** 递增凭证版本；供锁定/管理员重置密码后撤销全部旧会话 */
+  async revokeCredentials(userId) {
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [r] = await conn.execute(
+        'UPDATE users SET credential_version = credential_version + 1 WHERE id = ?',
+        [userId]
+      );
+      if (r.affectedRows !== 1) {
+        await conn.rollback();
+        return null;
+      }
+      const [[row]] = await conn.execute(
+        'SELECT credential_version FROM users WHERE id = ?', [userId]
+      );
+      await conn.commit();
+      return Number(row.credential_version);
+    } catch (e) {
+      try { await conn.rollback(); } catch { /* ignore */ }
+      throw e;
+    } finally {
+      conn.release();
+    }
+  }
+
   async seed(users) {
     for (const u of users) {
       await this.pool.execute(

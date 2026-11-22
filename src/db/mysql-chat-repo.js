@@ -94,6 +94,14 @@ class MysqlChatRepo extends ChatRepo {
     return rows[0] ? toSession(rows[0]) : null;
   }
 
+  async hasSession(userId, id) {
+    const [rows] = await this.pool.execute(
+      'SELECT 1 FROM chat_sessions WHERE id = ? AND user_id = ? LIMIT 1',
+      [id, userId]
+    );
+    return rows.length > 0;
+  }
+
   async saveSession(userId, session) {
     const conn = await this.pool.getConnection();
     try {
@@ -143,6 +151,14 @@ class MysqlChatRepo extends ChatRepo {
     } finally {
       conn.release();
     }
+  }
+
+  async purgeSession(userId, id) {
+    const [r] = await this.pool.execute(
+      'DELETE FROM chat_sessions WHERE id = ? AND user_id = ?',
+      [id, userId]
+    );
+    return r.affectedRows === 1;
   }
 
   async renameSession(userId, id, title) {
