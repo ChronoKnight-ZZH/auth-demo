@@ -16,12 +16,15 @@
     "start:dist": "node dist/src/server.js",
     "dev": "node src/server.js",
     "mock:upstream": "node scripts/mock-upstream.js",
+    "mock:echo": "node scripts/echo-upstream.js",
     "test": "node test/unit.test.js && node --test test/stream.test.js",
     "smoke": "node scripts/smoke.js",
     "smoke:stream": "node scripts/smoke-stream.js",
+    "smoke:echo": "node scripts/smoke-echo.js",
+    "test:echo": "node --test --test-timeout=25000 test/echo-upstream.test.js",
     "verify:gate": "node scripts/verify-gate.js",
     "verify:webcrypto": "node scripts/verify-webcrypto.js",
-    "verify:all": "node test/unit.test.js && node --test test/stream.test.js && node scripts/smoke.js && node scripts/smoke-stream.js && node scripts/verify-gate.js && node scripts/verify-webcrypto.js"
+    "verify:all": "node test/unit.test.js && node --test test/stream.test.js && node --test --test-timeout=25000 test/echo-upstream.test.js && node scripts/smoke.js && node scripts/smoke-stream.js && node scripts/smoke-echo.js && node scripts/verify-gate.js && node scripts/verify-webcrypto.js"
   },
   "dependencies": {
     "argon2": "^0.41.1",

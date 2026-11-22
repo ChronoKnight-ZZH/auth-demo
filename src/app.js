@@ -12,6 +12,9 @@ const { createAuthenticate } = require('./middleware/authenticate');
 const { createAuthService } = require('./services/auth-service');
 const { createRoutes } = require('./routes/auth');
 const { createChatRoutes } = require('./routes/chat');
+const { createProxyRoutes } = require('./routes/proxy');
+const { createSessionRoutes } = require('./routes/sessions');
+const { createFileRoutes } = require('./routes/file-storage');
 const { CircuitBreaker } = require('./lib/circuit-breaker');
 const { RelayService } = require('./stream/relay-service');
 const { warmup, hashPassword } = require('./crypto/password');
@@ -20,13 +23,21 @@ async function buildStores() {
   const useMysql = Boolean(config.mysql.url);
   const useRedis = Boolean(config.redis.url);
 
-  let userRepo, sessionStore;
+  let userRepo, sessionStore, chatRepo, fileRepo;
   if (useMysql) {
     const { MysqlUserRepo } = require('./db/mysql-user-repo');
+    const { MysqlChatRepo } = require('./db/mysql-chat-repo');
+    const { MysqlFileRepo } = require('./db/mysql-file-repo');
     userRepo = new MysqlUserRepo();
+    chatRepo = new MysqlChatRepo();
+    fileRepo = config.files.mode === 'local' ? new MysqlFileRepo() : null;
   } else {
     const { MemoryUserRepo } = require('./db/memory-user-repo');
+    const { MemoryChatRepo } = require('./db/memory-chat-repo');
+    const { MemoryFileRepo } = require('./db/memory-file-repo');
     userRepo = new MemoryUserRepo();
+    chatRepo = new MemoryChatRepo();
+    fileRepo = config.files.mode === 'local' ? new MemoryFileRepo() : null;
   }
   if (useRedis) {
     const { RedisSessionStore } = require('./session/redis-store');
@@ -35,7 +46,18 @@ async function buildStores() {
     const { MemorySessionStore } = require('./session/memory-store');
     sessionStore = new MemorySessionStore();
   }
-  return { userRepo, sessionStore, backends: { user: useMysql ? 'mysql' : 'memory', session: useRedis ? 'redis' : 'memory' } };
+  return {
+    userRepo,
+    sessionStore,
+    chatRepo,
+    fileRepo,
+    backends: {
+      user: useMysql ? 'mysql' : 'memory',
+      session: useRedis ? 'redis' : 'memory',
+      chat: useMysql ? 'mysql' : 'memory',
+      files: config.files.mode === 'local' ? (useMysql ? 'mysql+disk' : 'memory+disk') : 'off',
+    },
+  };
 }
 
 /** 事件缓冲：与 SessionStore 同构 —— Redis 优先，缺 Redis 自动降级内存（A-U-03 双实现） */
@@ -55,7 +77,7 @@ async function createApp() {
   }
   for (const w of configWarnings()) console.warn('[配置提示] ' + w);
 
-  const { userRepo, sessionStore, backends } = await buildStores();
+  const { userRepo, sessionStore, chatRepo, fileRepo, backends } = await buildStores();
 
   // 启动自检：存储连通性（A-B-03）
   let userStoreVersion;
@@ -68,6 +90,19 @@ async function createApp() {
     await sessionStore.ping();
   } catch (e) {
     throw new Error(`会话存储连接失败: ${e.message}`);
+  }
+  try {
+    await chatRepo.ping();
+  } catch (e) {
+    throw new Error(`聊天存储连接失败: ${e.message}`);
+  }
+  if (fileRepo) {
+    try {
+      await fileRepo.ping();
+      await require('./files/blob-store').init();
+    } catch (e) {
+      throw new Error(`文件存储初始化失败: ${e.message}`);
+    }
   }
 
   const { buffer, kind: bufferKind } = buildEventBuffer(Boolean(config.redis.url));
@@ -121,6 +156,11 @@ async function createApp() {
       backends: { ...backends, stream: bufferKind },
       userStoreVersion,
       env: config.env,
+      files: {
+        mode: config.files.mode,
+        dedupe: config.files.dedupeScope,
+        maxBytes: config.files.maxBytes,
+      },
       relay: {
         upstream: config.upstream.baseUrl,
         upstreamConfigured: Boolean(config.upstream.apiKey),
@@ -131,7 +171,14 @@ async function createApp() {
   });
 
   app.use('/auth', createRoutes({ authService, authenticate }));
+  // 原件路由必须先于其他 /v1 路由：/files/content 靠票据鉴权，不能先被
+  // 会话路由的 router.use(authenticate) 拦成 TOKEN_MISSING
+  if (fileRepo) {
+    app.use('/v1', createFileRoutes({ fileRepo, chatRepo, authenticate }));
+  }
+  app.use('/v1', createSessionRoutes({ chatRepo, authenticate, fileRepo }));
   app.use('/v1', createChatRoutes({ relay, authenticate }));
+  app.use('/v1', createProxyRoutes({ authenticate }));
 
   // 静态登录页（在 404 兜底之前挂载，否则永不命中）
   app.use('/', express.static(path.join(__dirname, '..', 'public')));
@@ -139,7 +186,7 @@ async function createApp() {
   app.use((req, res) => res.status(404).json({ code: 'NOT_FOUND', message: '资源不存在' }));
   app.use(errorHandler);
 
-  return { app, userRepo, sessionStore, buffer, cache, relay, backends: { ...backends, stream: bufferKind }, limiter };
+  return { app, userRepo, sessionStore, chatRepo, fileRepo, buffer, cache, relay, backends: { ...backends, stream: bufferKind }, limiter };
 }
 
 module.exports = { createApp };

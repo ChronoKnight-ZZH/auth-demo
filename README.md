@@ -42,6 +42,25 @@ npm start
 
 > `--ignore-scripts` 说明：`argon2` 的安装脚本是 `node-gyp-build`（无预编译产物时才编译）。若不希望跳过，可先 `npm install -g node-gyp` 并确保有 C++ 工具链。**上线前必须在目标机用不带 `--ignore-scripts` 的 `npm ci` 验证一次**（方案 A-B-01）。
 
+## 本地 MySQL + Redis
+
+本机联调使用：
+
+```env
+MYSQL_URL=mysql://deepseek:<password>@127.0.0.1:3306/deepseek
+REDIS_URL=redis://127.0.0.1:6379/0
+```
+
+初始化并写入种子用户：
+
+```bash
+node scripts/migrate.js
+node scripts/seed.js --mysql
+npm start
+```
+
+`/health` 应显示 `user=mysql`、`session=redis`、`chat=mysql`、`files=mysql+disk`。
+
 ## 构建产物（dist）
 
 服务是纯 CommonJS，不需要编译；`build` 做的是**运行时打包**：
@@ -104,7 +123,7 @@ npm start
 `/health` 会显示当前使用的后端：
 
 ```json
-{"ok":true,"backends":{"user":"mysql","session":"redis"},"userStoreVersion":"8.4.x"}
+{"ok":true,"backends":{"user":"mysql","session":"redis","chat":"mysql","files":"mysql+disk","stream":"redis"},"userStoreVersion":"8.4.x"}
 ```
 
 ## 接口
@@ -117,6 +136,30 @@ npm start
 | `POST` | `/auth/logout` | Bearer | 删除当前会话（幂等） |
 | `GET` | `/auth/me` | Bearer | 凭证验证，返回 `{ userId }` |
 | `POST` | `/auth/change-password` | Bearer | 校验旧密码 → 更新哈希 → 撤销全部会话 |
+
+BFF（浏览器不再持有上游 Key）：
+
+| 方法 | 路径 | 认证 | 说明 |
+| --- | --- | --- | --- |
+| `POST` | `/v1/chat/stream` | Bearer | 流式聊天；支持 `X-Request-Id` 与 `Last-Event-ID` 续推 |
+| `GET` | `/v1/chat/stream` | Bearer | 只读续推：`?requestId=&cursor=` |
+| `POST` | `/v1/chat/stop` | Bearer | 停止自己的流；返回 `{ ok, stopped }` |
+| `GET` | `/v1/models` | Bearer | 上游连通性探测 |
+| `POST` | `/v1/files` | Bearer | 附件 multipart 透传到上游 Files API |
+| `DELETE` | `/v1/files/:fileId` | Bearer | 删除上游文件 |
+| `POST` | `/v1/tools/asr` | Bearer | 语音识别代理（≤8MB） |
+| `POST` | `/v1/tools/tts` | Bearer | 语音合成代理，返回音频流 |
+| `POST` | `/v1/files/originals` | Bearer | **服务端原件归档**：请求体即文件字节，文件名/MIME 放 `X-File-Name` / `X-File-Mime` |
+| `GET` | `/v1/files/originals/:id/url` | Bearer | 按 `?sessionId=` 签发短期 `p`（内联）/ `r`（下载）/ `t` 票据 |
+| `DELETE` | `/v1/files/originals/:id` | Bearer | 软删除原件元数据（物理块留给后续 GC） |
+| `GET` | `/v1/files/content` | 票据 | 凭 `?file_id=&state=&ty=` 读取原件；支持 Range / ETag |
+| `GET` | `/v1/sessions` | Bearer | 会话列表；`?full=1` 返回全部消息（搜索/导出用） |
+| `GET` | `/v1/sessions/:id` | Bearer | 读取单个会话 |
+| `POST` | `/v1/sessions` | Bearer | 新建会话（前端通常直接用 PUT upsert） |
+| `PUT` | `/v1/sessions/:id` | Bearer | 整条会话 upsert（消息 JSON） |
+| `PATCH` | `/v1/sessions/:id` | Bearer | 重命名 |
+| `DELETE` | `/v1/sessions/:id` | Bearer | 软删除单个会话 |
+| `DELETE` | `/v1/sessions` | Bearer | 清空当前用户全部会话 |
 
 ### 载荷格式
 
@@ -134,6 +177,38 @@ npm start
 
 两者都用长度前缀，**不要**用 `||` 等分隔符拼接。
 
+## 附件原件存储（里程碑 3）
+
+浏览器 IndexedDB 只是缓存；**服务端保存原件**，换设备/清缓存后仍能显示和下载。
+
+- **内容寻址**：`<FILES_DIR>/blobs/<sha256[0:2]>/<sha256>`，上传时边收边算 sha256，
+  先写 `tmp/` 再 `fsync` + `rename` 原子落盘；同内容自动去重（`DEDUPE_SCOPE=global`
+  跨用户复用，`user` 只在用户内复用）。
+- **元数据**：`app_files`（归属、sha256、storage_key、size、mime、name、is_image、软删除）+
+  `app_file_refs`（文件 → 会话引用）。`PUT /v1/sessions/:id` 时从消息 JSON 的
+  `files[].storageId` 重建引用；引用同步失败只告警，不阻塞会话保存。
+- **票据而非 Bearer**：`<img src>` 无法携带 `Authorization`。`GET /v1/files/originals/:id/url`
+  按会话签发 HMAC 票据（默认 30 min），`GET /v1/files/content` 只验票据，并回查
+  **文件归属 + 会话存活**；跨用户与不存在统一 404，篡改/过期统一 403。
+- **票据不入库**：不写进会话 JSON，前端只缓存到过期前；图片加载失败时重签一次。
+- **安全响应头**：`X-Content-Type-Options: nosniff`、`Content-Security-Policy: sandbox`、
+  非图片一律 `attachment` + `application/octet-stream`；MIME 以文件头嗅探为准，
+  伪装成 `image/svg+xml` 等会被降级为二进制，避免 XSS。
+- **限制**：单文件默认 64 MiB（`FILES_MAX_BYTES`），与前端 `MAX_SIZE_MB` 对齐；
+  存储键只由服务端生成，拒绝任何含路径分隔符的输入。
+
+```env
+FILES_MODE=local                 # off = 关闭服务端原件，前端退回纯 IndexedDB
+FILES_DIR=/data/deepseek/files   # 生产挂载独立磁盘
+FILES_MAX_BYTES=67108864
+FILE_TOKEN_SECRET=<强随机值>      # 未设置时用 PEPPER 派生，仅限本地开发
+FILE_TOKEN_TTL_MS=1800000
+DEDUPE_SCOPE=global              # global | user
+```
+
+> 缩略图生成、病毒扫描、物理块 GC 均未实现：软删除只影响元数据，已上传的 blob
+> 需后续离线清理任务回收。文件预览当前只支持图片（浏览器内弹窗），文档只提供下载。
+
 ## 错误码
 
 | code | HTTP | 含义 |
@@ -148,12 +223,65 @@ npm start
 | `AUTH_BUSY` | 429 | Argon2 并发闸满 |
 | `SESSION_WRITE_FAILED` | 503 | 会话写入失败 |
 | `SESSION_STORE_UNAVAILABLE` | 503 | 会话存储不可用（非凭证问题） |
+| `UPSTREAM_NOT_CONFIGURED` | 503 | 服务端未配置上游 Key |
+| `UPSTREAM_UNAVAILABLE` | 503 | 熔断打开 |
+| `UPSTREAM_REJECTED` | 502 | 上游拒绝请求（含上游 401/403） |
+| `UPSTREAM_ERROR` | 502 | 上游 5xx / 网络错误 |
+| `UPSTREAM_TIMEOUT` | 504 | 上游超时 |
+| `UPSTREAM_RATE_LIMITED` | 429 | 上游限流 |
+| `PAYLOAD_TOO_LARGE` | 413 | 请求体超过路由上限 |
+| `FILE_TOKEN_INVALID` | 403 | 文件票据非法、被篡改或已过期 |
+| `FILE_ACCESS_DENIED` | 404 | 文件/会话不属于当前用户或已删除（与不存在统一） |
+| `FILES_DISABLED` | 503 | `FILES_MODE=off`，服务端未启用原件能力 |
+
+## 本地测试上游
+
+后台默认连远程 API（`UPSTREAM_BASE_URL=https://api.deepseek.com`）。要离线跑通中转链路，仓库提供两个本地假上游，都只需改 `.env` 里的 `UPSTREAM_BASE_URL` / `UPSTREAM_API_KEY`，业务代码零改动：
+
+| 脚本 | 端口 | 用途 |
+| --- | --- | --- |
+| `npm run mock:upstream` | 8787 | 吐固定 `tok0 tok1 …`，配合 `npm run smoke:stream` 验证链路机制 |
+| `npm run mock:echo` | 8788 | **复读机**：原样复读你发的内容，验证「转发保真度」 |
+
+### 复读机（echo-upstream）
+
+```bash
+npm run mock:echo
+# .env
+#   UPSTREAM_BASE_URL=http://127.0.0.1:8788
+#   UPSTREAM_API_KEY=sk-echo-any-non-empty-value
+npm start
+```
+
+- 浏览器打开 <http://127.0.0.1:8788> = 自带极简测试台，绕开登录直接打 `/v1/chat/completions`，可单独确认复读机本身工作。
+- 端点覆盖后台用到的全部上游路径：`/anthropic/v1/messages`（Anthropic 流式 + 非流式）、`/v1/chat/completions`（OpenAI 流式 + 非流式）、`/models`、`/anthropic/v1/files`、`/v1/tools/asr`、`/v1/tools/tts`。
+- 复读正文会附一行元信息（`model` / `stream` / `user轮次` / `system 字数` / `非文本块`），**附件是否真送到上游一眼可见**；`GET /__calls` 看上游收到的完整请求，`POST /__reset` 清空。
+- 在聊天框正文首行打命令即可注入故障，不必改代码或配置（也支持 `?fail=500` query 与 `metadata.mock`）：
+
+  | 命令 | 效果 |
+  | --- | --- |
+  | `/fail 500` / `429` / `400` / `network` / `idle` / `errorframe` | 上游异常：真实状态码 / 掐 socket / 发一帧后永久静默 |
+  | `/delay 3s` | 首字节延迟（测 headers 超时与前端 loading） |
+  | `/gap 300` | 每个增量间隔 300ms（测心跳、慢流） |
+  | `/stopat 5` | 只发 5 块就断，不发 `message_stop`（测断点续推） |
+  | `/tokens 40` | 强制切成 40 块 |
+  | `/repeat 3` | 复读 3 遍（测长回复、缓冲截断） |
+  | `/mode upper\|reverse\|count` | 大写 / 倒序 / 只报字数 |
+  | `/stop max_tokens` | 指定 `stop_reason` |
+
+```bash
+npm run test:echo      # 复读机自身 12 项单测（零依赖）
+npm run smoke:echo     # 复读机 × 中转链路 端到端 19 项（自起服务，不需 MySQL/Redis/远程 Key）
+```
 
 ## 测试与验收
 
 ```bash
-npm test                  # 单元测试（16 项）
+npm test                  # 单元测试（21 项）
+npm run test:echo         # 本地复读机上游单测（12 项，零依赖）
 npm run smoke             # 端到端冒烟（需服务已启动，16 项）
+npm run smoke:stream      # 中转链路端到端（自起 mock 上游）
+npm run smoke:echo        # 中转链路端到端（自起复读机上游，零远程依赖）
 npm run verify:gate       # 闸门/时序/不可区分性验证（需服务已启动）
 npm run verify:webcrypto  # 前端 WebCrypto 互通性验证
 npm run verify:all        # 串行执行以上全部
@@ -209,9 +337,19 @@ auth-demo/
 │   │   ├── rsa.js              # OAEP 解密 + 载荷协议
 │   │   └── password.js         # Argon2id + pepper + 并发闸
 │   ├── db/
-│   │   ├── user-repo.js        # 接口
-│   │   ├── mysql-user-repo.js  # MySQL 实现
-│   │   └── memory-user-repo.js # 内存实现
+│   │   ├── user-repo.js        # 用户接口
+│   │   ├── mysql-user-repo.js  # 用户 MySQL 实现
+│   │   ├── memory-user-repo.js # 用户内存实现
+│   │   ├── chat-repo.js        # 会话接口
+│   │   ├── mysql-chat-repo.js  # 会话 MySQL 实现
+│   │   ├── memory-chat-repo.js # 会话内存实现
+│   │   ├── file-repo.js        # 原件元数据接口
+│   │   ├── mysql-file-repo.js  # 原件 MySQL 实现
+│   │   └── memory-file-repo.js # 原件内存实现
+│   ├── files/
+│   │   ├── blob-store.js       # 内容寻址、原子落盘、Range
+│   │   ├── mime.js             # 文件头嗅探与安全降级
+│   │   └── token.js            # HMAC 访问票据
 │   ├── session/
 │   │   ├── token.js            # Token 生成与哈希
 │   │   ├── store.js            # 接口（revokeAll = 版本失效）
@@ -219,9 +357,17 @@ auth-demo/
 │   │   └── memory-store.js     # 内存实现（A-U-03 第二实现）
 │   ├── middleware/authenticate.js
 │   ├── services/auth-service.js
-│   ├── routes/auth.js
+│   ├── routes/auth.js          # 认证
+│   ├── routes/sessions.js      # 会话持久化
+│   ├── routes/file-storage.js  # 原件上传 / 票据 / 读取
+│   ├── routes/chat.js          # 聊天流转发 + stop
+│   ├── routes/proxy.js         # 文件 / TTS / ASR 代理
 │   └── lib/                    # 错误、限流、.env 加载
-├── migrations/001_init.sql
+├── migrations/
+│   ├── 001_init.sql            # users
+│   ├── 002_chat.sql            # chat_sessions
+│   └── 003_files.sql           # app_files / app_file_refs
+├── data/files/                 # 本地原件目录（已 gitignore，生产另行挂载）
 ├── scripts/                    # 密钥、迁移、种子、冒烟、验证、构建
 ├── test/unit.test.js
 ├── deploy/                     # systemd、Nginx
@@ -230,6 +376,10 @@ auth-demo/
 ```
 
 ## 生产部署（CentOS Stream 9）
+
+> **CentOS 7(glibc 2.17)只能 yum 装 Node 16,而本项目 `/v1` 中转需要 Node 18+ 的 fetch/Web Streams。**
+> 免改代码的做法是安装 unofficial-builds 的 `linux-x64-glibc-217` 专用构建并让 systemd 指向它,
+> 步骤与校验要求见 [deploy/centos7-node20.md](deploy/centos7-node20.md)。
 
 ```bash
 # 1) 依赖
@@ -293,6 +443,8 @@ performance_schema=OFF
 ```bash
 mysqldump --single-transaction --routines --triggers auth_demo \
   | gzip > /var/backups/auth-$(date +%F).sql.gz
+# 附件原件与数据库元数据必须一起备份
+tar czf /var/backups/auth-files-$(date +%F).tar.gz -C /var/lib/auth-demo files
 # 必须同步到机外
 ```
 
@@ -303,9 +455,12 @@ mysqldump --single-transaction --routines --triggers auth_demo \
 3. **RSA 字段加密不能替代 TLS**，必须由 Nginx 终结并强制 HTTP→HTTPS。
 4. 本 Demo 未实现「记住我」/ Refresh Token（方案 §10 Q-09 已确认不做）；会话最长 7 天。
 5. 「不保证 Redis 故障期间会话存活」（方案 N-07）：Redis 重启且未开 AOF 时版本键可能丢失，此时旧会话按「放行并告警」处理。
+6. 文件票据是**能力 URL**：拿到链接的人在有效期内即可读取，因此不要把 `state` 写进日志、埋点或对外分享；示例 Nginx 已对 `/v1/files/content` 关闭 `access_log`。删除会话后票据立即失效。
 
 ## 已知限制
 
 - Argon2 档位为 `m=19456,t=2,p=1`，低于 OWASP 首选档，是为 2C4G 单机做的**显式取舍**（方案 N-08）；PHC 留痕，扩容后自动 rehash 升级。
 - 单机单实例，无 Sentinel/Cluster。
+- 附件原件为**单机本地磁盘**：多实例部署前需换成共享存储；软删除不做物理 GC，也没有缩略图、病毒扫描与文档预览。
+- 服务端只保存原件与元数据；浏览器 IndexedDB 仍是首屏显示与离线写入的缓存，删除会话不会删除已上传的原件元数据（仅解除引用）。
 - 本机实测环境为 Windows + Node 20；**目标环境 CentOS Stream 9 + Node 22 的构建与压测未执行**。

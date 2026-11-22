@@ -4,5 +4,6 @@ secrets/
 *.log
 .DS_Store
 .runtime/
+data/
 coverage/
 dist/

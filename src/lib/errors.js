@@ -29,6 +29,10 @@ const CODES = {
   UPSTREAM_ERROR: [502, '上游服务异常'],
   /** 上游超时 */
   UPSTREAM_TIMEOUT: [504, '上游响应超时'],
+  /** 上游限流 */
+  UPSTREAM_RATE_LIMITED: [429, '上游限流，请稍后重试'],
+  /** 请求体超过路由上限 */
+  PAYLOAD_TOO_LARGE: [413, '请求体过大'],
   /** 中转并发闸满 */
   RELAY_BUSY: [429, '并发流已满，请稍后重试'],
   /** 续推游标非法（非数字等） */
@@ -39,6 +43,14 @@ const CODES = {
   STREAM_EXPIRED: [410, '该回复流已结束并过期'],
   /** 请求体中的模型不在白名单 */
   MODEL_NOT_ALLOWED: [400, '模型不在允许列表'],
+
+  // ---- 附件原件（里程碑 3）----
+  /** 文件票据非法、被篡改或已过期（统一 403，不区分原因） */
+  FILE_TOKEN_INVALID: [403, '文件访问票据无效'],
+  /** 文件归属或会话归属不匹配（与不存在统一 404，避免探测） */
+  FILE_ACCESS_DENIED: [404, '文件不存在'],
+  /** 文件服务关闭 */
+  FILES_DISABLED: [503, '文件服务未启用'],
 };
 
 class AppError extends Error {
@@ -59,7 +71,7 @@ function errorHandler(err, req, res, next) { // eslint-disable-line no-unused-va
   if (res.headersSent) return;
   if (err instanceof AppError) return sendError(res, err.code);
   if (err && err.code === 'AUTH_BUSY') return sendError(res, 'AUTH_BUSY');
-  if (err && err.type === 'entity.too.large') return sendError(res, 'INVALID_INPUT');
+  if (err && err.type === 'entity.too.large') return sendError(res, 'PAYLOAD_TOO_LARGE');
 
   // 未预期错误：日志保留堆栈，对外只给 INTERNAL
   // eslint-disable-next-line no-console

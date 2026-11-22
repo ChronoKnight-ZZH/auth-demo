@@ -24,7 +24,7 @@ async function main() {
     const root = await mysql.createConnection({ uri: url.toString() });
     await root.query(
       `CREATE DATABASE IF NOT EXISTS \`${dbName}\`
-       DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`
+       DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
     );
     await root.end();
     console.log(`数据库 ${dbName} 已就绪`);

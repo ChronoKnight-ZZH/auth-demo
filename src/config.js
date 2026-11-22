@@ -4,6 +4,7 @@
  * 环境变量优先，缺省值即方案定稿的默认值。
  */
 const crypto = require('node:crypto');
+const path = require('node:path');
 
 function int(name, def) {
   const v = process.env[name];
@@ -96,6 +97,9 @@ const config = {
     apiKey: process.env.UPSTREAM_API_KEY || '',
     messagesPath: process.env.UPSTREAM_MESSAGES_PATH || '/anthropic/v1/messages',
     modelsPath: process.env.UPSTREAM_MODELS_PATH || '/models',
+    filesPath: process.env.UPSTREAM_FILES_PATH || '/anthropic/v1/files',
+    asrPath: process.env.UPSTREAM_ASR_PATH || '/v1/tools/asr',
+    ttsPath: process.env.UPSTREAM_TTS_PATH || '/v1/tools/tts',
     /** 首字节（响应头）超时 */
     headersTimeoutMs: int('UPSTREAM_HEADERS_TIMEOUT_MS', 30_000),
     /** 相邻两个数据块之间的静默超时（比总超时更适合流式） */
@@ -150,6 +154,26 @@ const config = {
     crossUser: bool('CACHE_CROSS_USER', false),
   },
 
+  // ---- 附件原件存储（里程碑 3）----
+  files: {
+    /**
+     * local：服务端保存原件并签发短期票据；
+     * off：关闭服务端文件能力，前端退回纯 IndexedDB。
+     */
+    mode: process.env.FILES_MODE === 'off' ? 'off' : 'local',
+    /** 原件目录，默认仓库内 data/files（生产请挂载独立磁盘） */
+    dir: process.env.FILES_DIR || path.join(__dirname, '..', 'data', 'files'),
+    /** 单文件上限，与前端 MAX_SIZE_MB 对齐 */
+    maxBytes: int('FILES_MAX_BYTES', 64 * 1024 * 1024),
+    /** 票据 HMAC 密钥；缺省时用 PEPPER 派生（仅本地开发） */
+    tokenSecret: process.env.FILE_TOKEN_SECRET || '',
+    tokenTtlMs: int('FILE_TOKEN_TTL_MS', 30 * 60 * 1000),
+    /** global：跨用户按 sha256 去重；user：只在用户内去重 */
+    dedupeScope: process.env.DEDUPE_SCOPE === 'user' ? 'user' : 'global',
+    /** 票据密钥标识，支持轮换 */
+    keyId: process.env.FILE_TOKEN_KID || 'k1',
+  },
+
   // ---- 其他 ----
   bodyLimit: process.env.BODY_LIMIT || '16kb',
   /** /v1 聊天请求体上限：附件按 file_id 引用，正文本身不需要很大 */
@@ -186,6 +210,9 @@ function configWarnings() {
   }
   if (config.cache.enabled && config.cache.crossUser) {
     warnings.push('CACHE_CROSS_USER=1 已开启跨用户复用，多租户部署请显式确认此取舍');
+  }
+  if (config.files.mode === 'local' && !config.files.tokenSecret) {
+    warnings.push('FILE_TOKEN_SECRET 未设置 —— 文件票据将使用 PEPPER 派生密钥，生产环境请显式配置');
   }
   return warnings;
 }

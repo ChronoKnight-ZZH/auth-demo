@@ -111,7 +111,8 @@ class RelayService {
   sanitizeToUpstream(body) {
     const out = { model: body.model, messages: body.messages, stream: true };
     for (const k of ['system', 'max_tokens', 'temperature', 'top_p', 'top_k',
-      'stop_sequences', 'thinking', 'tools', 'tool_choice', 'metadata']) {
+      'stop_sequences', 'thinking', 'tools', 'tool_choice', 'metadata',
+      'title', 'safety_check']) {
       if (body[k] !== undefined) out[k] = body[k];
     }
     return out;
@@ -453,7 +454,8 @@ class RelayService {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-store, no-transform',
-      Connection: 'keep-alive',
+      // SSE 是长连接：结束后立即关闭，避免浏览器/代理把这条 socket 复用给紧随其后的普通请求
+      Connection: 'close',
       'X-Accel-Buffering': 'no',   // 关掉 Nginx 响应缓冲，否则 SSE 会被攒成一坨
       'X-Request-Id': requestId,   // 前端据此带 Last-Event-ID 续推
       'X-Content-Type-Options': 'nosniff',
@@ -588,6 +590,21 @@ class RelayService {
   }
 
   // ---------------------------------------------------------------- 运维
+
+  /**
+   * 用户主动停止生成。只允许停止自己的流。
+   * abort reason 带 code=ABORTED，producer 据此把终态记为 ABORTED，
+   * tail 通过 relay_end 的 code 让前端把回复标记为 stopped。
+   */
+  stop(userId, requestId) {
+    if (typeof requestId !== 'string' || !requestId.trim()) return false;
+    const handle = this.producers.get(requestId);
+    if (!handle || String(handle.userId) !== String(userId)) return false;
+    const reason = new Error('client stopped');
+    reason.code = 'ABORTED';
+    handle.abort.abort(reason);
+    return true;
+  }
 
   async stopAll() {
     for (const h of this.producers.values()) h.stop();

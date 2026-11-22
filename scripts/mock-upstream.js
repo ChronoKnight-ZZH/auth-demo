@@ -43,6 +43,14 @@ function readBody(req) {
   });
 }
 
+function readRaw(req) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/models') {
     res.writeHead(req.headers.authorization ? 200 : 401, { 'content-type': 'application/json' });
@@ -60,6 +68,50 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ ok: true }));
   }
 
+  // Files API：只校验 Key 和 multipart 能到达，返回可用的假 file_id
+  if (req.method === 'POST' && req.url === '/anthropic/v1/files') {
+    const raw = await readRaw(req);
+    if (!req.headers['x-api-key'] && !req.headers.authorization) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: 'missing api key' } }));
+    }
+    if (!String(req.headers['content-type'] || '').startsWith('multipart/form-data')) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: 'expected multipart/form-data' } }));
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({
+      id: 'file-mock-' + require('node:crypto').randomBytes(6).toString('hex'),
+      type: 'file',
+      size_bytes: raw.length,
+      created_at: new Date().toISOString(),
+      filename: 'mock-upload.bin',
+      mime_type: 'application/octet-stream',
+    }));
+  }
+
+  if (req.method === 'DELETE' && req.url.startsWith('/anthropic/v1/files/')) {
+    if (!req.headers['x-api-key'] && !req.headers.authorization) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: 'missing api key' } }));
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true }));
+  }
+
+  if (req.method === 'POST' && req.url === '/v1/tools/asr') {
+    await readRaw(req);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ text: 'mock transcript' }));
+  }
+
+  if (req.method === 'POST' && req.url === '/v1/tools/tts') {
+    await readRaw(req);
+    // 100ms 24kHz 单声道 16-bit 静音
+    res.writeHead(200, { 'content-type': 'audio/pcm' });
+    return res.end(Buffer.alloc(24000 * 2 / 10));
+  }
+
   if (req.method === 'POST' && req.url === '/anthropic/v1/messages') {
     const body = await readBody(req);
     const auth = req.headers.authorization || '';
@@ -72,6 +124,8 @@ const server = http.createServer(async (req, res) => {
       model: body.model,
       stream: body.stream,
       messages: Array.isArray(body.messages) ? body.messages.length : 0,
+      title: Boolean(body.title && body.title.enabled),
+      safety: body.safety_check ? body.safety_check.level : null,
       fail,
     });
 
@@ -91,8 +145,8 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ error: { type: 'rate_limit_error', message: `mock ${status}` } }));
     }
 
-    const tokens = Math.max(1, Number(mock.tokens || 12));
-    const gap = Math.max(0, Number(mock.gap || 15));
+    const tokens = Math.max(1, Number(mock.tokens || process.env.MOCK_TOKENS || 12));
+    const gap = Math.max(0, Number(mock.gap || process.env.MOCK_GAP || 15));
     const msgId = 'mock_' + require('node:crypto').randomBytes(6).toString('hex');
 
     res.writeHead(200, {

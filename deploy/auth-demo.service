@@ -24,10 +24,17 @@ Environment=RSA_PRIVATE_KEY_PATH=%d/rsa_private.pem
 Environment=RSA_PUBLIC_KEY_PATH=%d/rsa_public.pem
 Environment=PEPPER_FILE=%d/pepper
 
+# 默认用 yum 安装的 node；CentOS 7（glibc 2.17）请改用 unofficial-builds 的
+# glibc-217 构建（本项目需要 Node 18+ 的 fetch/Web Streams），见 centos7-node20.md：
+# ExecStart=/opt/node/bin/node --max-old-space-size=384 src/server.js
 ExecStart=/usr/bin/node --max-old-space-size=384 src/server.js
 
 Restart=always
 RestartSec=2
+
+# 附件原件目录：StateDirectory 由 systemd 创建并授权给服务用户
+StateDirectory=auth-demo
+Environment=FILES_DIR=/var/lib/auth-demo/files
 
 # 内存上限（方案 §4.2：2C4G 单机预算）
 MemoryHigh=450M

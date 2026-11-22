@@ -44,6 +44,16 @@ function createChatRoutes({ relay, authenticate }) {
     res.json({ ok: true, status: r.status });
   });
 
+  // POST /v1/chat/stop —— 用户主动停止自己正在生成的流
+  router.post('/chat/stop', authenticate, express.json({ limit: '1kb' }), (req, res) => {
+    const raw = req.body?.requestId ?? req.headers['x-request-id'];
+    if (typeof raw !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(raw.trim())) {
+      return sendError(res, 'INVALID_INPUT');
+    }
+    const stopped = relay.stop(req.userId, raw.trim());
+    return res.json({ ok: true, stopped });
+  });
+
   return router;
 }
 
