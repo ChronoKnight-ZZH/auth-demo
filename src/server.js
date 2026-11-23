@@ -2,6 +2,7 @@
 /**
  * 服务器入口。启动失败时明确拒绝启动并给出原因（方案 A-B-03）。
  */
+require('./lib/fetch-global');
 require('./lib/load-env').loadEnv();
 const { createApp } = require('./app');
 const { config } = require('./config');

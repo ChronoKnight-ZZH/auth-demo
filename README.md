@@ -2,7 +2,7 @@
 
 后端登录与凭证验证 Demo，按《后端登录与凭证验证实施方案》实现。
 
-技术栈：**Node.js（20+/22 LTS）+ Express 5 + MySQL 8.4（可选）+ Redis 7.2（可选）**
+技术栈：**Node.js（16.17+ / 18 / 20 / 22）+ Express 5 + MySQL 8.4（可选）+ Redis 7.2（可选）**
 
 ## 三条核心安全约束的落地
 
@@ -505,9 +505,21 @@ certbot --nginx -d chat.shunkai-dg.cn -d api.shunkai-dg.cn \
 systemctl enable --now auth-demo-backup.timer auth-demo-healthcheck.timer
 ```
 
-> **CentOS 7(glibc 2.17)**：yum 只有 Node 16，而 `/v1` 需要 Node 18+ 的 fetch/Web Streams。
-> 使用 unofficial-builds 的 `linux-x64-glibc-217` 构建，并把 systemd 的 `ExecStart`
-> 改为 `/opt/node/bin/node`；步骤与校验见 [deploy/centos7-node20.md](deploy/centos7-node20.md)。
+> **CentOS 7(glibc 2.17)**：yum 只有 Node 16，可按下方「Node 16 兼容」直接运行；
+> 但生产仍推荐用 unofficial-builds 的 `linux-x64-glibc-217` 构建安装 Node 20，并把 systemd 的
+> `ExecStart` 改为 `/opt/node/bin/node`；步骤与校验见 [deploy/centos7-node20.md](deploy/centos7-node20.md)。
+
+## Node 16 兼容
+
+服务与验收脚本可在 **Node 16.17+** 运行（Node 16 已于 2023-09 EOL，仅用于无法升级的存量环境）：
+
+- 全局 `fetch` 由 `undici@5` 补齐（`src/lib/fetch-global.js`，仅在缺失时加载）；Node 18+ 不加载，行为不变。
+- `proxy.js` 的 Web Stream → Node Stream 桥接已兼容：Node 17+ 用 `Readable.fromWeb`，Node 16 走手写背压拉取。
+- `/health` 的 `files.disk` 在 Node 16 为 `null`（`fs.statfs` 是 Node 18.15+），其余字段不变。
+- 测试侧补齐了 Node 16 缺失的 `t.after`；`--test-timeout` 已从 npm 脚本移除。
+- `express@5` 声明 `engines >=18`，在 Node 16 上实测可运行但不受官方支持；`npm install` 会给出引擎警告（未启用 `engine-strict`，不会失败）。
+
+> 生产环境仍建议 Node 20 LTS。Node 16 的 TLS/HTTP 栈不再收到安全更新，用于登录系统需自行承担风险。
 
 ### 关键运维配置（勿遗漏）
 

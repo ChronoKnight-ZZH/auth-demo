@@ -7,7 +7,8 @@
  */
 process.env.PEPPER = process.env.PEPPER || 'test-pepper-0123456789abcdef';
 
-const test = require('node:test');
+const nodeTest = require('node:test');
+require('../src/lib/fetch-global');
 const assert = require('node:assert');
 const http = require('node:http');
 const crypto = require('node:crypto');
@@ -18,6 +19,27 @@ const { MemoryEventBuffer } = require('../src/stream/memory-buffer');
 const { CircuitBreaker, withRetry } = require('../src/lib/circuit-breaker');
 const { normalizeBody, makeCacheKey, MemoryResponseCache } = require('../src/stream/cache');
 const { config } = require('../src/config');
+
+/**
+ * Node 16 的 TestContext 没有 t.after()（18.8+ 才有）。这里补等价清理：
+ * 测试体结束后逆序执行，确保 mock server / 定时器被关闭，测试进程能退出。
+ */
+function test(name, fn) {
+  return nodeTest(name, async (t) => {
+    if (typeof t.after === 'function') return fn(t);
+    const hooks = [];
+    t.after = (hook) => { hooks.push(hook); };
+    try {
+      return await fn(t);
+    } finally {
+      for (const hook of hooks.reverse()) {
+        try { await hook(); } catch { /* 清理失败不影响断言结果 */ }
+      }
+    }
+  });
+}
+test.before = nodeTest.before;
+test.after = nodeTest.after;
 
 // ---------------------------------------------------------------- SSE 编解码
 

@@ -20,6 +20,27 @@ const FILE_LIMIT = '64mb';
 const ASR_LIMIT = '8mb';
 const TTS_LIMIT = '1mb';
 
+/**
+ * Web ReadableStream → Node Readable。
+ * Node 17+ 用内置 Readable.fromWeb；Node 16 没有该方法，按背压手动拉取。
+ */
+function toNodeReadable(webStream) {
+  if (typeof Readable.fromWeb === 'function') return Readable.fromWeb(webStream);
+  return Readable.from((async function* () {
+    const reader = webStream.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        yield Buffer.isBuffer(value) ? value : Buffer.from(value);
+      }
+    } finally {
+      try { reader.releaseLock(); } catch { /* 已释放 */ }
+      try { await webStream.cancel(); } catch { /* 已结束 */ }
+    }
+  })());
+}
+
 function upstreamHeaders(req, { files = false, json = false } = {}) {
   const headers = { Authorization: `Bearer ${config.upstream.apiKey}` };
   if (files) {
@@ -96,7 +117,7 @@ async function forward(req, res, { path, method = 'POST', body, files = false, j
     };
     res.once('finish', done);
     try {
-      Readable.fromWeb(response.body).pipe(res);
+      toNodeReadable(response.body).pipe(res);
     } catch {
       done();
       res.destroy();

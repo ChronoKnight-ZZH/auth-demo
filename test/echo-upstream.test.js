@@ -3,7 +3,7 @@
  * echo-upstream 自检：拉起复读机进程，逐条验证「真的在复读」以及故障注入是否可用。
  * 用法：npm run test:echo     （无需 MySQL/Redis/远程 Key）
  */
-const { test } = require('node:test');
+const nodeTest = require('node:test');
 const assert = require('node:assert');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
@@ -75,8 +75,19 @@ async function waitUp() {
   throw new Error('echo-upstream 未能启动');
 }
 
-test.before(async () => { await waitUp(); });
-test.after(() => { child.kill(); });
+// Node 16 顶层注册的 test.before/test.after 不会执行（只在 describe 套件内生效），
+// 这里把「等服务就绪」放进每个测试，并用 unref + exit 兜底清理子进程。
+const ready = waitUp();
+child.unref();
+if (typeof child.stderr.unref === 'function') child.stderr.unref();
+process.once('exit', () => { try { child.kill(); } catch { /* 已退出 */ } });
+
+function test(name, fn) {
+  return nodeTest(name, async (t) => {
+    await ready;
+    return fn(t);
+  });
+}
 
 test('E-01 复读最后一条用户消息（Anthropic 流式，逐块下发且以 message_stop 收场）', async () => {
   const text = '第一段。\n第二段：hello world。';

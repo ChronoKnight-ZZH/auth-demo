@@ -6,6 +6,8 @@
 const fsp = require('node:fs/promises');
 
 async function diskInfo(dir) {
+  // fs.statfs 是 Node 18.15+；Node 16 上不采集磁盘指标，健康检查照常返回
+  if (typeof fsp.statfs !== 'function') return null;
   try {
     const stat = await fsp.statfs(dir);
     const totalBytes = Number(stat.blocks) * Number(stat.bsize);
