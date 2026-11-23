@@ -21,10 +21,15 @@
  *   X-03 断连续推：拼接正文与完整一次一致，且上游只被打 1 次
  *   X-04 /fail 500 → 502（真实状态码，非 SSE）；/fail idle → 504
  *   X-05 Key 边界：下发内容中绝无服务端 Key
+ *
+ * 会话改走 HttpOnly Cookie：用 createFetcher 维护 Cookie Jar，登录后自动携带，
+ * 状态变更请求由 fetcher 注入 Origin 通过 CSRF。
  */
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
+require('../src/lib/fetch-global');
+const { createFetcher } = require('./_client');
 
 const OVERRIDE_BASE = process.env.SMOKE_BASE || '';
 const ECHO_PORT = Number(process.env.SMOKE_ECHO_PORT || 8791);
@@ -32,10 +37,11 @@ const APP_PORT = Number(process.env.SMOKE_APP_PORT || 3120);
 const SERVER_KEY = 'sk-server-side-only-echo-key';
 
 let BASE = OVERRIDE_BASE;
+let F = null;
 let pubKeyPem = null;
 let oaepHash = 'sha256';
 
-// ---------------------------------------------------------------- 复用 smoke-stream 的调用范式
+// ---------------------------------------------------------------- 调用范式
 
 function encrypt(plaintext) {
   return crypto.publicEncrypt(
@@ -51,32 +57,31 @@ function encodeLogin(username, password) {
   ]).toString('utf8');
 }
 
-async function loadKeys(base = BASE) {
-  const pk = await (await fetch(base + '/auth/public-key')).json();
+async function loadKeys() {
+  const pk = await (await F.fetch('/auth/public-key')).json();
   pubKeyPem = pk.publicKey;
   oaepHash = pk.oaepHash;
 }
 
-async function login(username, password, base = BASE) {
-  const res = await fetch(base + '/auth/login', {
+async function login(username, password) {
+  const res = await F.fetch('/auth/login', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ encrypted: encrypt(encodeLogin(username, password)) }),
   });
   const body = await res.json();
   if (!res.ok) throw new Error(`登录失败 ${res.status} ${JSON.stringify(body)}`);
-  return body.token;
+  return body;
 }
 
 /** 读一条经中继下发的 SSE，返回事件、正文增量、终止帧、游标 */
-async function readStream(urlPath, { token, body, cursor, requestId, stopAfterDeltas, base = BASE } = {}) {
+async function readStream(urlPath, { body, cursor, requestId, stopAfterDeltas } = {}) {
   const h = { accept: 'text/event-stream' };
   if (body) h['content-type'] = 'application/json';
-  if (token) h.authorization = `Bearer ${token}`;
   if (cursor !== undefined) h['last-event-id'] = String(cursor);
   if (requestId) h['x-request-id'] = requestId;
 
-  const res = await fetch(base + urlPath, {
+  const res = await F.fetch(urlPath, {
     method: 'POST', headers: h, body: body ? JSON.stringify(body) : undefined,
   });
   const out = {
@@ -219,22 +224,22 @@ async function main() {
       BASE = `http://127.0.0.1:${APP_PORT}`;
       if (!await waitFor(`${BASE}/health`)) throw new Error('被测服务启动失败\n' + app.getLog());
     }
+    F = createFetcher(BASE);
     console.log(`目标：${BASE}   上游：http://127.0.0.1:${ECHO_PORT}（本地复读机）\n`);
     await loadKeys();
 
     // ---- X-00 ----
-    const health = await (await fetch(BASE + '/health')).json();
+    const health = await (await F.fetch('/health')).json();
     check('X-00a 上游指向本地复读机（零成本、不出网）',
       /127\.0\.0\.1/.test(health.relay.upstream), health.relay.upstream);
     check('X-00b 服务端已配 Key', health.relay.upstreamConfigured === true);
 
-    const token = await login('alice', 'Alice@Passw0rd');
+    await login('alice', 'Alice@Passw0rd');
 
     // ---- X-01 正文原样复读 ----
     await resetEcho();
     const probe = '中文混 English 123 与标点，测试复读保真度。\n第二行也要回来。';
     const r1 = await readStream('/v1/chat/stream', {
-      token,
       body: { model: 'echo-model', messages: [{ role: 'user', content: probe }], metadata: { mock: { gap: 15 } } },
     });
     check('X-01a 流式 200 且 relay_end=done', r1.status === 200 && r1.isSse && r1.endData?.status === 'done',
@@ -249,7 +254,6 @@ async function main() {
     // ---- X-02 system / 多轮 / 附件引用 到达上游 ----
     await resetEcho();
     const r2 = await readStream('/v1/chat/stream', {
-      token,
       body: {
         model: 'echo-model',
         system: '你是被设定过的人设',
@@ -281,18 +285,18 @@ async function main() {
     const long = '续推一致性检查。'.repeat(20);
     // 参照物：同一条正文完整跑一遍（复读机的分块与切分是确定性的）
     const reference = await readStream('/v1/chat/stream', {
-      token, requestId: 'echorefere' + crypto.randomBytes(4).toString('hex'),
+      requestId: 'echorefere' + crypto.randomBytes(4).toString('hex'),
       body: { model: 'echo-model', messages: [{ role: 'user', content: long }], metadata: { mock: { gap: 5 } } },
     });
     await resetEcho();
     const part1 = await readStream('/v1/chat/stream', {
-      token, requestId: reqId,
+      requestId: reqId,
       body: { model: 'echo-model', messages: [{ role: 'user', content: long }], metadata: { mock: { gap: 40 } } },
       stopAfterDeltas: 3,
     });
     const mid = await callCount();
     const part2 = await readStream('/v1/chat/stream', {
-      token, requestId: reqId, cursor: part1.lastEventId,
+      requestId: reqId, cursor: part1.lastEventId,
     });
     const after = await callCount();
     check('X-03a 中途断开被识别（未收到 relay_end=done）', part1.aborted && part1.joined.length > 0);
@@ -307,14 +311,12 @@ async function main() {
 
     // ---- X-04 故障透传为真实 HTTP 状态码 ----
     const f500 = await readStream('/v1/chat/stream', {
-      token,
       body: { model: 'echo-model', messages: [{ role: 'user', content: '/fail 500\n触发上游 5xx' }] },
     });
     check('X-04a 上游 500 → 502 且响应不是 SSE（前端拦截器可区分）',
       f500.status === 502 && !f500.isSse, `${f500.status} ${f500.json?.code}`);
 
     const fIdle = await readStream('/v1/chat/stream', {
-      token,
       body: { model: 'echo-model', messages: [{ role: 'user', content: '/fail idle\n静默到 idle 超时' }] },
     });
     check('X-04b 上游只发一帧后静默 → 首帧后失败用 SSE error 帧收场（502/504 已不可能）',
@@ -323,7 +325,6 @@ async function main() {
       `${fIdle.status} ${JSON.stringify(fIdle.endData)}`);
 
     const f400 = await readStream('/v1/chat/stream', {
-      token,
       body: { model: 'echo-model', messages: [{ role: 'user', content: '/fail 400' }] },
     });
     check('X-04c 上游 4xx → 502 UPSTREAM_REJECTED 且不重试',

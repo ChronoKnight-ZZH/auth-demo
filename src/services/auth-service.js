@@ -98,7 +98,12 @@ function createAuthService({ userRepo, sessionStore, limiter }) {
       throw new AppError('SESSION_WRITE_FAILED');
     }
 
-    return { token, expiresAt: absoluteExpiresAt };
+    return {
+      token,
+      expiresAt: absoluteExpiresAt,
+      userId: user.id,
+      username: user.username,
+    };
   }
 
   async function safeDummyVerify() {
@@ -111,7 +116,17 @@ function createAuthService({ userRepo, sessionStore, limiter }) {
   }
 
   async function logout(tokenHash) {
-    await sessionStore.delete(tokenHash);
+    await sessionStore.delete(tokenHash).catch(() => {});
+  }
+
+  /**
+   * 当前登录用户信息：供 /auth/me 在前端启动时恢复登录态。
+   * 用户名无法从会话存储拿到（只存了 userId），故回查用户表。
+   */
+  async function me(userId) {
+    const user = await userRepo.findById(userId);
+    if (!user) return null;
+    return { userId: user.id, username: user.username };
   }
 
   /**
@@ -156,7 +171,7 @@ function createAuthService({ userRepo, sessionStore, limiter }) {
     return { credentialVersion: nextVersion };
   }
 
-  return { login, logout, changePassword };
+  return { login, logout, me, changePassword };
 }
 
 module.exports = { createAuthService };

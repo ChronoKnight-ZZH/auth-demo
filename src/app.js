@@ -9,6 +9,8 @@ const { config, validateConfig, configWarnings } = require('./config');
 const { errorHandler } = require('./lib/errors');
 const { createRateLimiter } = require('./lib/rate-limiter');
 const { createCors } = require('./middleware/cors');
+const { createCookieParser } = require('./middleware/cookie-parser');
+const { createCsrf } = require('./middleware/csrf');
 const { createAuthenticate } = require('./middleware/authenticate');
 const { createAuthService } = require('./services/auth-service');
 const { createRoutes } = require('./routes/auth');
@@ -149,6 +151,11 @@ async function createApp() {
   // CORS_ORIGINS 留空 = 同源反代，中间件退化为直通，不影响任何现有行为。
   // 必须在 body 解析与鉴权之前：预检 OPTIONS 不带 Authorization，也不能被 JSON 解析拦住。
   app.use(createCors(config.cors));
+
+  // Cookie 解析先于所有路由：鉴权中间件从 req.cookies 取会话 token。
+  app.use(createCookieParser());
+  // CSRF：会话改走 HttpOnly Cookie 后，状态变更请求必须校验 Origin/Referer 白名单。
+  app.use(createCsrf({ origins: config.cors.origins, enabled: config.cookie.csrfEnabled }));
 
   // 全局 16kb：登录密文只有数百字节，收紧默认面；
   // /v1 中转单独放宽到 CHAT_BODY_LIMIT（express.json 先到先得，故按路径跳过全局解析）

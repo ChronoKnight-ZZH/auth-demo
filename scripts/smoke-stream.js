@@ -8,22 +8,15 @@
  *   npm run smoke:stream
  *   SMOKE_BASE=http://127.0.0.1:3000 node scripts/smoke-stream.js   # 复用已在跑的服务（跳过自启动）
  *
- * 覆盖项：
- *   S-00 健康检查暴露 stream 后端与「上游是否已配 Key」
- *   S-01 登录签发 token → /v1/chat/stream 以 Bearer 流式返回
- *   S-02 先鉴权后推流：无/坏 token → 401 JSON（响应绝不伪装成 SSE）
- *   S-03 事件带递增 id；响应头 X-Request-Id 供前端续推
- *   S-05 长流期间写心跳注释行，维持代理空闲与会话 TTL
- *   S-04 断联重发（A 类）：已收内容不重复，续推补齐，拼接等于全文，上游只被打 1 次
- *   S-06 游标语义：非法游标 400、未知 requestId 410、超前游标幂等收尾
- *   S-07 撤销（C 类）：改密后旧 token 的流式请求 401；重登后重发成功（B 类）
- *   S-08 缓存：相同请求第二次不再打上游，回放正文一致
- *   S-09 熔断：连续 5xx 后 503，且不再穿透到上游
- *   S-10 Key 边界：上游 Key 绝不出现在任何下发内容中，但确实只出现在服务端→上游
+ * 会话改走 HttpOnly Cookie：用 createFetcher 维护 Cookie Jar，登录后自动携带；
+ * 状态变更请求由 fetcher 注入 Origin 通过 CSRF。子模式（缓存/熔断/超时）各自
+ * 连独立端口的 app，故各自创建独立 fetcher（互不污染会话）。
  */
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
+require('../src/lib/fetch-global');
+const { createFetcher } = require('./_client');
 
 const OVERRIDE_BASE = process.env.SMOKE_BASE || '';
 const MOCK_PORT = Number(process.env.SMOKE_MOCK_PORT || 8787);
@@ -33,6 +26,7 @@ const APP_PORT = Number(process.env.SMOKE_APP_PORT || 3110);
 const SERVER_KEY = 'sk-server-side-only-secret';
 
 let BASE = OVERRIDE_BASE;
+let F = null; // 默认 fetcher，连 BASE，main 里赋值
 let pubKeyPem = null;
 let oaepHash = 'sha256';
 
@@ -62,21 +56,22 @@ function encodeChange(username, oldPassword, newPassword) {
   ]).toString('utf8');
 }
 
-async function loadKeys(base = BASE) {
-  const pk = await (await fetch(base + '/auth/public-key')).json();
+async function loadKeys(fetcher = F) {
+  const pk = await (await fetcher.fetch('/auth/public-key')).json();
   pubKeyPem = pk.publicKey;
   oaepHash = pk.oaepHash;
 }
 
-async function login(username, password, base = BASE) {
-  const res = await fetch(base + '/auth/login', {
+/** 登录成功后 Cookie 进入 fetcher 的 Jar；返回响应体（仅用于断言，不含 token） */
+async function login(username, password, fetcher = F) {
+  const res = await fetcher.fetch('/auth/login', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ encrypted: encrypt(encodeLogin(username, password)) }),
   });
   const body = await res.json();
   if (!res.ok) throw new Error(`登录失败 ${res.status} ${JSON.stringify(body)}`);
-  return body.token;
+  return body;
 }
 
 /**
@@ -86,11 +81,11 @@ async function login(username, password, base = BASE) {
  */
 const BOB_PASSWORDS = ['Bob@Passw0rd', 'Bob@NewPassw0rd', 'Bob@StreamPw2', 'Bob@StreamPw3'];
 
-async function resolvePasswordPair(username, base = BASE) {
+async function resolvePasswordPair(username, fetcher = F) {
   let index = -1;
   for (let i = 0; i < BOB_PASSWORDS.length; i++) {
     try {
-      await login(username, BOB_PASSWORDS[i], base);
+      await login(username, BOB_PASSWORDS[i], fetcher);
       index = i;
       break;
     } catch { /* 试下一个 */ }
@@ -99,10 +94,11 @@ async function resolvePasswordPair(username, base = BASE) {
   return { current: BOB_PASSWORDS[index], next: BOB_PASSWORDS[(index + 1) % BOB_PASSWORDS.length] };
 }
 
-async function jsonCall(method, urlPath, { body, token, base = BASE } = {}) {
+async function jsonCall(method, urlPath, { body, token, fresh } = {}, fetcher = F) {
+  const f = fresh ? createFetcher(fetcher.base) : fetcher;
   const h = { 'content-type': 'application/json' };
   if (token) h.authorization = `Bearer ${token}`;
-  const res = await fetch(base + urlPath, { method, headers: h, body: body ? JSON.stringify(body) : undefined });
+  const res = await f.fetch(urlPath, { method, headers: h, body: body ? JSON.stringify(body) : undefined });
   const text = await res.text();
   let json = null;
   try { json = JSON.parse(text); } catch { /* 非 JSON */ }
@@ -112,14 +108,16 @@ async function jsonCall(method, urlPath, { body, token, base = BASE } = {}) {
 /**
  * 读一条 SSE。
  * @param {object} o
- *   token        Bearer
+ *   token        Bearer（仅用于构造“坏 token”用例；正常靠 Cookie）
  *   body         请求体（续推时可省）
  *   cursor       Last-Event-ID（带则走续推分支）
  *   requestId    X-Request-Id
  *   stopAfterDeltas 收到 N 个正文增量后主动断开（模拟网络断连）
+ *   fresh        用全新空 Jar 的 fetcher（构造“无 Cookie”用例）
  * @returns 状态码/头/事件数组/正文增量拼接/终止帧/原始文本/是否主动断开
  */
-async function readStream(urlPath, { token, body, cursor, requestId, stopAfterDeltas, base = BASE } = {}) {
+async function readStream(urlPath, { token, body, cursor, requestId, stopAfterDeltas, fresh } = {}, fetcher = F) {
+  const f = fresh ? createFetcher(fetcher.base) : fetcher;
   const h = { accept: 'text/event-stream' };
   if (body) h['content-type'] = 'application/json';
   if (token) h.authorization = `Bearer ${token}`;
@@ -127,7 +125,7 @@ async function readStream(urlPath, { token, body, cursor, requestId, stopAfterDe
   if (requestId) h['x-request-id'] = requestId;
 
   const started = Date.now();
-  const res = await fetch(base + urlPath, {
+  const res = await f.fetch(urlPath, {
     method: 'POST', headers: h, body: body ? JSON.stringify(body) : undefined,
   });
   const out = {
@@ -165,12 +163,12 @@ async function readStream(urlPath, { token, body, cursor, requestId, stopAfterDe
       for (const line of block.split('\n')) {
         if (!line || line.startsWith(':')) continue;
         const c = line.indexOf(':');
-        const f = c === -1 ? line : line.slice(0, c);
+        const f2 = c === -1 ? line : line.slice(0, c);
         let v = c === -1 ? '' : line.slice(c + 1);
         if (v.startsWith(' ')) v = v.slice(1);
-        if (f === 'data') ev.data = ev.data ? `${ev.data}\n${v}` : v;
-        else if (f === 'event') ev.event = v;
-        else if (f === 'id') ev.id = v;
+        if (f2 === 'data') ev.data = ev.data ? `${ev.data}\n${v}` : v;
+        else if (f2 === 'event') ev.event = v;
+        else if (f2 === 'id') ev.id = v;
       }
       out.events.push(ev);
       if (ev.event === 'content_block_delta') deltaCount += 1;
@@ -288,6 +286,7 @@ async function main() {
       children.push(relay.app);
       BASE = relay.base;
     }
+    F = createFetcher(BASE);
     console.log(`目标：${BASE}\n`);
     await loadKeys();
 
@@ -301,16 +300,18 @@ async function main() {
       `upstream=${health.body.relay.upstream}`);
 
     // ---- ① 登录 ----
-    const token = await login('alice', 'Alice@Passw0rd');
-    check('S-01a 登录签发 Opaque Token', typeof token === 'string' && token.length >= 42, `len=${token.length}`);
+    const loginResp = await login('alice', 'Alice@Passw0rd');
+    check('S-01a 登录成功并下发会话 Cookie（响应体不含 token）',
+      Boolean(loginResp && loginResp.username && !loginResp.token),
+      `username=${loginResp && loginResp.username}`);
 
-    // ---- S-02 先鉴权后推流 ----
-    const noTok = await readStream('/v1/chat/stream', { body: { model: 'm', messages: [{ role: 'user', content: 'hi' }] } });
-    check('S-02a 无 token → 401 TOKEN_MISSING 且响应非 SSE',
+    // ---- S-02 先鉴权后推流（用空 Jar 的全新 fetcher，确保不带 Cookie）----
+    const noTok = await readStream('/v1/chat/stream', { fresh: true, body: { model: 'm', messages: [{ role: 'user', content: 'hi' }] } });
+    check('S-02a 无 Cookie → 401 TOKEN_MISSING 且响应非 SSE',
       noTok.status === 401 && !noTok.isSse && noTok.json && noTok.json.code === 'TOKEN_MISSING',
       `${noTok.status} ${noTok.json && noTok.json.code}`);
 
-    const badTok = await readStream('/v1/chat/stream', { token: 'bogus-token', body: { model: 'm', messages: [{ role: 'user', content: 'hi' }] } });
+    const badTok = await readStream('/v1/chat/stream', { fresh: true, token: 'bogus-token', body: { model: 'm', messages: [{ role: 'user', content: 'hi' }] } });
     check('S-02b 坏 token → 401 TOKEN_INVALID 且未开始推流',
       badTok.status === 401 && !badTok.isSse && badTok.json.code === 'TOKEN_INVALID',
       `${badTok.status} ${badTok.json.code}`);
@@ -318,7 +319,6 @@ async function main() {
     // ---- S-01 / S-03 / S-10 正常流式 ----
     await resetMock();
     const s1 = await readStream('/v1/chat/stream', {
-      token,
       body: { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hello stream' }], metadata: { mock: { tokens: 8, gap: 20 } } },
     });
     check('S-01 流式 200 + text/event-stream + 完整正文',
@@ -342,7 +342,6 @@ async function main() {
 
     // ---- S-05 心跳 ----
     const hb = await readStream('/v1/chat/stream', {
-      token,
       body: { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hb' }], metadata: { mock: { tokens: 3, gap: 900 } } },
     });
     check('S-05 上游静默期间服务端写心跳注释行（: hb）',
@@ -353,7 +352,7 @@ async function main() {
     await resetMock();
     const reqId = 'smoke_resume_' + crypto.randomBytes(6).toString('hex');
     const part1 = await readStream('/v1/chat/stream', {
-      token, requestId: reqId,
+      requestId: reqId,
       body: { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'resume me' }], metadata: { mock: { tokens: 10, gap: 120 } } },
       stopAfterDeltas: 4,
     });
@@ -365,11 +364,11 @@ async function main() {
     const callsMid = await callCount();
     check('S-04b 断线后 producer 独立跑完，上游仍只被调用一次',
       callsMid < 0 || callsMid === 1, callsMid < 0 ? '（外部 mock，跳过）' : `calls=${callsMid}`);
-    const stAfter = await jsonCall('GET', `/auth/me`, { token });
+    const stAfter = await jsonCall('GET', '/auth/me');
     check('S-04c 期间会话仍有效（心跳滑动续期，未被误判过期）',
       stAfter.status === 200, `${stAfter.status}`);
 
-    const part2 = await readStream('/v1/chat/stream', { token, requestId: reqId, cursor: part1.lastEventId });
+    const part2 = await readStream('/v1/chat/stream', { requestId: reqId, cursor: part1.lastEventId });
     check('S-04d 带 Last-Event-ID 续推 200 并补齐剩余增量',
       part2.status === 200 && part2.isSse && part2.joined.includes('tok9'),
       `续推 "${part2.joined.trim()}"`);
@@ -383,52 +382,49 @@ async function main() {
     check('S-04g 续推不再打上游（不重复计费）', callsAfter.length === 1, `calls=${callsAfter.length}`);
 
     // ---- S-06 游标语义 ----
-    const badCursor = await readStream('/v1/chat/stream', { token, requestId: reqId, cursor: 'abc' });
+    const badCursor = await readStream('/v1/chat/stream', { requestId: reqId, cursor: 'abc' });
     check('S-06a 非法游标 → 400 CURSOR_INVALID（非 SSE）',
       badCursor.status === 400 && badCursor.json && badCursor.json.code === 'CURSOR_INVALID', `${badCursor.status}`);
 
-    const ghost = await readStream('/v1/chat/stream', { token, requestId: 'ghost_stream_0001', cursor: 3 });
+    const ghost = await readStream('/v1/chat/stream', { requestId: 'ghost_stream_0001', cursor: 3 });
     check('S-06b 未知 requestId 续推 → 410 STREAM_EXPIRED',
       ghost.status === 410 && ghost.json.code === 'STREAM_EXPIRED', `${ghost.status} ${ghost.json.code}`);
 
-    const ahead = await readStream('/v1/chat/stream', { token, requestId: reqId, cursor: 999999 });
+    const ahead = await readStream('/v1/chat/stream', { requestId: reqId, cursor: 999999 });
     check('S-06c 游标超前：幂等收尾（200 + relay_end），不报错不重复',
       ahead.status === 200 && ahead.endData !== null && ahead.joined === '', `${ahead.status}`);
 
-    const noCursor = await readStream('/v1/chat/stream', { token, requestId: reqId, body: { model: 'm', messages: [{ role: 'user', content: 'dup submit' }] } });
+    const noCursor = await readStream('/v1/chat/stream', { requestId: reqId, body: { model: 'm', messages: [{ role: 'user', content: 'dup submit' }] } });
     check('S-06d 同 requestId 裸重发：幂等回放而非再打上游',
       noCursor.status === 200 && (await mockCalls()).length === callsAfter.length, `${noCursor.status}`);
 
     // ---- S-07 撤销与重登（C 类 → B 类）----
     await resetMock();
     const pair = await resolvePasswordPair('bob');
-    const bobTok = await login('bob', pair.current);
+    await login('bob', pair.current); // 会话进 F.jar
     const bobStream = await readStream('/v1/chat/stream', {
-      token: bobTok,
       body: { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'bob first' }] },
     });
     check('S-07a bob 流式请求正常', bobStream.status === 200 && bobStream.endData.status === 'done', `${bobStream.status}`);
 
     const chg = await jsonCall('POST', '/auth/change-password', {
-      token: bobTok,
       body: { encrypted: encrypt(encodeChange('bob', pair.current, pair.next)) },
     });
     check('S-07b 改密递增 credential_version', chg.status === 200 && chg.body.credentialVersion >= 2, JSON.stringify(chg.body));
 
+    // 改密后服务端清 Cookie，F.jar 已被移除；再请求即无 Cookie → 401
     const revoked = await readStream('/v1/chat/stream', {
-      token: bobTok,
       body: { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'should fail' }] },
     });
-    check('S-07c 改密后旧 token 的流式请求 → 401（撤销在推流之前生效）',
-      revoked.status === 401 && !revoked.isSse && revoked.json.code === 'TOKEN_INVALID',
-      `${revoked.status} ${revoked.json.code}`);
+    check('S-07c 改密后旧会话的流式请求 → 401（撤销在推流之前生效）',
+      revoked.status === 401 && !revoked.isSse,
+      `${revoked.status} ${revoked.json && revoked.json.code}`);
 
-    const bobTok2 = await login('bob', pair.next);
+    await login('bob', pair.next);
     const retried = await readStream('/v1/chat/stream', {
-      token: bobTok2,
       body: { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'retry after relogin' }] },
     });
-    check('S-07d 重登后新 token 重发未完成的数据请求成功（③-B）',
+    check('S-07d 重登后新会话重发未完成的数据请求成功（③-B）',
       retried.status === 200 && retried.joined.includes('tok0'), `${retried.status}`);
 
     // ---- S-08 缓存（独立进程：CACHE_ENABLED=1）----
@@ -464,13 +460,14 @@ async function checkCacheMode(children) {
     check('S-08 缓存模式服务启动', false, e.message); return;
   }
   children.push(relay.app);
+  const sub = createFetcher(relay.base);
   try {
     await resetMock();
-    const tok = await login('alice', 'Alice@Passw0rd', relay.base);
+    await login('alice', 'Alice@Passw0rd', sub);
     const body = { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'cache me please' }] };
-    const first = await readStream('/v1/chat/stream', { token: tok, body, base: relay.base });
+    const first = await readStream('/v1/chat/stream', { body }, sub);
     const calls1 = (await mockCalls()).length;
-    const second = await readStream('/v1/chat/stream', { token: tok, body, base: relay.base });
+    const second = await readStream('/v1/chat/stream', { body }, sub);
     const calls2 = (await mockCalls()).length;
 
     check('S-08a 首次请求正常打上游一次', first.status === 200 && calls1 === 1, `status=${first.status} calls=${calls1}`);
@@ -498,15 +495,16 @@ async function checkBreakerMode(children) {
     check('S-09 熔断模式服务启动', false, e.message); return;
   }
   children.push(relay.app);
+  const sub = createFetcher(relay.base);
   try {
     await resetMock();
-    const tok = await login('alice', 'Alice@Passw0rd', relay.base);
+    await login('alice', 'Alice@Passw0rd', sub);
     const mk = () => ({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], metadata: { mock: { fail: 500 } } });
 
-    const a = await readStream('/v1/chat/stream', { token: tok, body: mk(), base: relay.base });
-    const b = await readStream('/v1/chat/stream', { token: tok, body: mk(), base: relay.base });
+    const a = await readStream('/v1/chat/stream', { body: mk() }, sub);
+    const b = await readStream('/v1/chat/stream', { body: mk() }, sub);
     const callsUpToNow = (await mockCalls()).length;
-    const c = await readStream('/v1/chat/stream', { token: tok, body: mk(), base: relay.base });
+    const c = await readStream('/v1/chat/stream', { body: mk() }, sub);
     const callsAfterOpen = (await mockCalls()).length;
 
     check('S-09a 上游 5xx → 502 且响应非 SSE（真实状态码收场）',
@@ -515,7 +513,7 @@ async function checkBreakerMode(children) {
       c.status === 503 && c.json && c.json.code === 'UPSTREAM_UNAVAILABLE', `${c.status} ${c.json && c.json.code}`);
     check('S-09c 熔断期间不再穿透上游', callsAfterOpen === callsUpToNow, `calls ${callsUpToNow} → ${callsAfterOpen}`);
 
-    const st = await jsonCall('GET', '/v1/relay/stats', { token: tok, base: relay.base });
+    const st = await jsonCall('GET', '/v1/relay/stats', {}, sub);
     check('S-09d /v1/relay/stats 暴露熔断状态与拒绝计数',
       st.status === 200 && st.body.breaker && st.body.breaker.state === 'open' && st.body.breaker.rejected > 0,
       JSON.stringify(st.body.breaker));
@@ -537,24 +535,23 @@ async function checkTimeoutMode(children) {
     check('S-11 超时模式服务启动', false, e.message); return;
   }
   children.push(relay.app);
+  const sub = createFetcher(relay.base);
   try {
     await resetMock();
-    const tok = await login('alice', 'Alice@Passw0rd', relay.base);
+    await login('alice', 'Alice@Passw0rd', sub);
 
     // 首帧之前的静默（先出 ping 才有帧，这里用 fail=500 之外的 idle：mock 先发 1 帧再静默）
     const idle = await readStream('/v1/chat/stream', {
-      token: tok, base: relay.base,
       body: { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'idle' }], metadata: { mock: { fail: 'idle' } } },
-    });
+    }, sub);
     check('S-11a 上游静默触发 idle 超时，流以 error 收场（不误标 done）',
       idle.status === 200 && idle.endData && idle.endData.status === 'error'
       && /TIMEOUT|UPSTREAM/.test(idle.endData.code || ''),
       `end=${JSON.stringify(idle.endData)} ${idle.ms}ms`);
 
     const abortCase = await readStream('/v1/chat/stream', {
-      token: tok, base: relay.base,
       body: { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'abort' }], metadata: { mock: { fail: 'abort', tokens: 3 } } },
-    });
+    }, sub);
     check('S-11b 上游不发 message_stop 就断 → status=error，已收增量保留',
       abortCase.endData && abortCase.endData.status === 'error' && abortCase.joined.includes('tok2'),
       `joined="${abortCase.joined.trim()}" end=${JSON.stringify(abortCase.endData)}`);

@@ -120,18 +120,22 @@ node src/server.js
 | `FILES_DIR` | `/data/files`（挂 volume） | 默认写仓库内 `data/files`，容器重建即丢原件 |
 | `CORS_ORIGINS` | 见下 | 仅前后端分域时需要 |
 
-### 跨域（CORS）
+### 跨域（CORS）与会话 Cookie
 
-后端鉴权用 **Opaque Bearer Token，不使用 Cookie**，因此没有 SameSite 跨站问题。是否下发
-CORS 头由 `CORS_ORIGINS` 单一开关决定（`src/middleware/cors.js`）：
+会话凭证为 **HttpOnly Cookie**（默认 `SameSite=Lax`、`Path=/`，生产加 `Secure`），浏览器在
+`credentials: include` 下自动携带；前端不持有 Token 原文。状态变更请求（POST/PUT/PATCH/DELETE）
+由 CSRF 中间件校验 `Origin`/`Referer` 白名单（与 `CORS_ORIGINS` 同一份名单，`src/middleware/csrf.js`）。
+是否下发 CORS 头由 `CORS_ORIGINS` 单一开关决定（`src/middleware/cors.js`）：
 
-- **同源反代**（前端 Nginx 把 `/auth`、`/v1` 转发到本站）：`CORS_ORIGINS` 留空，中间件
-  完全直通，行为与加它之前逐字节一致。这是 `deploy/nginx-auth-demo.conf` 的设计。
-- **分域直连**（前端 `chat.shunkai-dg.cn` 直接请求 `api.shunkai-dg.cn`）：必须设
-  `CORS_ORIGINS=https://chat.shunkai-dg.cn`（逗号分隔多个来源）。命中白名单时回显具体来源
-  `Access-Control-Allow-Origin` + `Allow-Credentials: true`，放行预检头 `Authorization`、
-  `Content-Type`、`Accept`、`X-Request-Id`、`X-File-Name`、`X-File-Mime`；非白名单来源预检
-  返回 403。`*` 会反射任意来源（无 Cookie 故无 CSRF 会话风险，但生产建议显式列白名单）。
+- **同源反代**（前端 Nginx 把 `/auth`、`/v1` 转发到本站）：`CORS_ORIGINS` 留空，Cookie 为
+  host-only（不设 `Domain`），最收敛；中间件完全直通，行为与加它之前逐字节一致。这是
+  `deploy/nginx-auth-demo.conf` 的设计。**不要**把 Cookie 的 `Domain` 写死成 `api.域名`，否则
+  浏览器不会把它带给 `chat.域名`。
+- **分域直连**（前端 `chat.shunkai-dg.cn` 直接请求 `api.shunkai-dg.cn`，共享 eTLD+1 = 同站）：
+  设 `CORS_ORIGINS=https://chat.shunkai-dg.cn`（逗号分隔多个来源）。命中白名单时回显具体来源
+  `Access-Control-Allow-Origin` + `Allow-Credentials: true`；`SameSite=Lax` 在同站请求中可携带
+  Cookie。若为真正跨站（不同 eTLD+1），须 `SESSION_COOKIE_SAMESITE=none` + `SESSION_COOKIE_SECURE=true`
+  并接受现代浏览器对第三方 Cookie 的限制。`*` + `Allow-Credentials` 不可共存（浏览器会拒绝）。
 
 > `chat-demo` 前端生产默认就是**分域直连** `api.shunkai-dg.cn`（`credentials: include`），
 > 所以线上后端记得配 `CORS_ORIGINS`，否则登录/聊天/上传会被浏览器全部拦截。
@@ -163,34 +167,36 @@ npm start
 | --- | --- | --- | --- |
 | `GET` | `/health` | 否 | 健康检查，显示存储后端与版本 |
 | `GET` | `/auth/public-key` | 否 | 返回 PEM 公钥 + `oaepHash` + `maxPlaintextBytes` |
-| `POST` | `/auth/login` | 否 | 接收 `{ encrypted }`，返回 `{ token, expiresAt }` |
-| `POST` | `/auth/logout` | Bearer | 删除当前会话（幂等） |
-| `GET` | `/auth/me` | Bearer | 凭证验证，返回 `{ userId }` |
-| `POST` | `/auth/change-password` | Bearer | 校验旧密码 → 更新哈希 → 撤销全部会话 |
+| `POST` | `/auth/login` | 否 | 接收 `{ encrypted }`；Set-Cookie 下发会话，响应体返回 `{ username, expiresAt }` |
+| `POST` | `/auth/logout` | 否（幂等） | 不要求先鉴权；清理服务端会话并清 Cookie，始终返回 200 |
+| `GET` | `/auth/me` | Cookie | 登录态恢复与凭证验证，返回 `{ userId, username, expiresAt }` |
+| `POST` | `/auth/change-password` | Cookie | 校验旧密码 → 更新哈希 → 撤销全部会话并清 Cookie |
+
+> 除标注「否」外，认证列均指 **HttpOnly Cookie**；`Authorization: Bearer` 仅保留给 CLI / 旧客户端作过渡回退。
 
 BFF（浏览器不再持有上游 Key）：
 
 | 方法 | 路径 | 认证 | 说明 |
 | --- | --- | --- | --- |
-| `POST` | `/v1/chat/stream` | Bearer | 流式聊天；支持 `X-Request-Id` 与 `Last-Event-ID` 续推 |
-| `GET` | `/v1/chat/stream` | Bearer | 只读续推：`?requestId=&cursor=` |
-| `POST` | `/v1/chat/stop` | Bearer | 停止自己的流；返回 `{ ok, stopped }` |
-| `GET` | `/v1/models` | Bearer | 上游连通性探测 |
-| `POST` | `/v1/files` | Bearer | 附件 multipart 透传到上游 Files API |
-| `DELETE` | `/v1/files/:fileId` | Bearer | 删除上游文件 |
-| `POST` | `/v1/tools/asr` | Bearer | 语音识别代理（≤8MB） |
-| `POST` | `/v1/tools/tts` | Bearer | 语音合成代理，返回音频流 |
-| `POST` | `/v1/files/originals` | Bearer | **服务端原件归档**：请求体即文件字节，文件名/MIME 放 `X-File-Name` / `X-File-Mime` |
-| `GET` | `/v1/files/originals/:id/url` | Bearer | 按 `?sessionId=` 签发短期 `p`（内联）/ `r`（下载）/ `t` 票据 |
-| `DELETE` | `/v1/files/originals/:id` | Bearer | 软删除原件元数据（物理块留给后续 GC） |
+| `POST` | `/v1/chat/stream` | Cookie | 流式聊天；支持 `X-Request-Id` 与 `Last-Event-ID` 续推 |
+| `GET` | `/v1/chat/stream` | Cookie | 只读续推：`?requestId=&cursor=` |
+| `POST` | `/v1/chat/stop` | Cookie | 停止自己的流；返回 `{ ok, stopped }` |
+| `GET` | `/v1/models` | Cookie | 上游连通性探测 |
+| `POST` | `/v1/files` | Cookie | 附件 multipart 透传到上游 Files API |
+| `DELETE` | `/v1/files/:fileId` | Cookie | 删除上游文件 |
+| `POST` | `/v1/tools/asr` | Cookie | 语音识别代理（≤8MB） |
+| `POST` | `/v1/tools/tts` | Cookie | 语音合成代理，返回音频流 |
+| `POST` | `/v1/files/originals` | Cookie | **服务端原件归档**：请求体即文件字节，文件名/MIME 放 `X-File-Name` / `X-File-Mime` |
+| `GET` | `/v1/files/originals/:id/url` | Cookie | 按 `?sessionId=` 签发短期 `p`（内联）/ `r`（下载）/ `t` 票据 |
+| `DELETE` | `/v1/files/originals/:id` | Cookie | 软删除原件元数据（物理块留给后续 GC） |
 | `GET` | `/v1/files/content` | 票据 | 凭 `?file_id=&state=&ty=` 读取原件；支持 Range / ETag |
-| `GET` | `/v1/sessions` | Bearer | 会话列表；`?full=1` 返回全部消息（搜索/导出用） |
-| `GET` | `/v1/sessions/:id` | Bearer | 读取单个会话 |
-| `POST` | `/v1/sessions` | Bearer | 新建会话（前端通常直接用 PUT upsert） |
-| `PUT` | `/v1/sessions/:id` | Bearer | 整条会话 upsert（消息 JSON） |
-| `PATCH` | `/v1/sessions/:id` | Bearer | 重命名 |
-| `DELETE` | `/v1/sessions/:id` | Bearer | 软删除单个会话 |
-| `DELETE` | `/v1/sessions` | Bearer | 清空当前用户全部会话 |
+| `GET` | `/v1/sessions` | Cookie | 会话列表；`?full=1` 返回全部消息（搜索/导出用） |
+| `GET` | `/v1/sessions/:id` | Cookie | 读取单个会话 |
+| `POST` | `/v1/sessions` | Cookie | 新建会话（前端通常直接用 PUT upsert） |
+| `PUT` | `/v1/sessions/:id` | Cookie | 整条会话 upsert（消息 JSON） |
+| `PATCH` | `/v1/sessions/:id` | Cookie | 重命名 |
+| `DELETE` | `/v1/sessions/:id` | Cookie | 软删除单个会话 |
+| `DELETE` | `/v1/sessions` | Cookie | 清空当前用户全部会话 |
 
 ### 载荷格式
 
@@ -218,7 +224,7 @@ BFF（浏览器不再持有上游 Key）：
 - **元数据**：`app_files`（归属、sha256、storage_key、size、mime、name、is_image、软删除）+
   `app_file_refs`（文件 → 会话引用）。`PUT /v1/sessions/:id` 时从消息 JSON 的
   `files[].storageId` 重建引用；引用同步失败只告警，不阻塞会话保存。
-- **票据而非 Bearer**：`<img src>` 无法携带 `Authorization`。`GET /v1/files/originals/:id/url`
+- **票据而非 Cookie**：`<img src>` / `<a download>` 在分域部署下不一定能带上 HttpOnly Cookie（跨源/第三方 Cookie 限制）。`GET /v1/files/originals/:id/url`
   按会话签发 HMAC 票据（默认 30 min），`GET /v1/files/content` 只验票据，并回查
   **文件归属 + 会话存活**；跨用户与不存在统一 404，篡改/过期统一 403。
 - **票据不入库**：不写进会话 JSON，前端只缓存到过期前；图片加载失败时重签一次。
@@ -289,7 +295,7 @@ npm run import:history -- --user alice --file backup.zip --replace
 | --- | --- | --- |
 | `INVALID_CREDENTIALS` | 401 | 账号或密码错误（也用于解密失败，不可区分） |
 | `INVALID_INPUT` | 400 | 输入格式/长度不合法 |
-| `TOKEN_MISSING` | 401 | 缺少 `Authorization: Bearer` |
+| `TOKEN_MISSING` | 401 | 缺少会话凭证（Cookie 与 `Authorization: Bearer` 均无） |
 | `TOKEN_INVALID` | 401 | Token 无效或已因改密失效 |
 | `TOKEN_EXPIRED` | 401 | 超过绝对寿命 |
 | `ACCOUNT_LOCKED` | 403 | 账号被锁定 |

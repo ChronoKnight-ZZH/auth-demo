@@ -78,6 +78,38 @@ const config = {
     touchThrottleMs: int('SESSION_TOUCH_THROTTLE_MS', 5 * 60 * 1000), // 5 min
   },
 
+  // ---- 会话 Cookie（HttpOnly 由后端下发；前端不再持有 token 原文）----
+  // 对应改造：Bearer Token → HttpOnly Cookie。前端只发 credentials: include，
+  // 浏览器自动携带；状态变更请求由 CSRF 中间件校验 Origin/Referer 白名单。
+  cookie: {
+    /** 会话 Cookie 名 */
+    name: process.env.SESSION_COOKIE_NAME || 'authdemo.session',
+    /** Cookie Path */
+    path: process.env.SESSION_COOKIE_PATH || '/',
+    /**
+     * Cookie Domain。留空 = host-only（同源反代推荐，最收敛）；
+     * 分域直连（chat.X 直连 api.X）时设为 `.shunkai-dg.cn` 让兄弟子域共享。
+     * 注意：写死成 api.域名会导致浏览器不把 Cookie 发给 chat.域名。
+     */
+    domain: process.env.SESSION_COOKIE_DOMAIN || '',
+    /**
+     * SameSite：lax = 同站可带、挡跨站（默认，配合 Origin 白名单够用）；
+     * none = 真正跨站才用，必须同时 Secure。
+     */
+    sameSite: (process.env.SESSION_COOKIE_SAMESITE || 'lax').toLowerCase(),
+    /**
+     * Secure：留空时按 NODE_ENV 自动（production = true）。
+     * 同源反代由 Nginx 终结 TLS，应用只监听回环，trustProxy 已开，Secure 不影响下发。
+     */
+    secure: (() => {
+      const v = process.env.SESSION_COOKIE_SECURE;
+      if (v === undefined || v === '') return process.env.NODE_ENV === 'production';
+      return v === '1' || v.toLowerCase() === 'true';
+    })(),
+    /** CSRF 防护开关：状态变更请求（POST/PUT/PATCH/DELETE）校验 Origin/Referer 白名单 */
+    csrfEnabled: bool('CSRF_ENABLED', true),
+  },
+
   // ---- 登录限流（方案 §6.2.5、§10 Q-06 定稿）----
   login: {
     maxPerAccount: int('LOGIN_MAX_PER_ACCOUNT', 10), // 10 次 / 15 min
@@ -220,6 +252,13 @@ function validateConfig() {
   }
   if (config.stream.heartbeatMs * 6 > config.session.idleMs) {
     errors.push('SSE_HEARTBEAT_MS 相对 SESSION_IDLE_MS 过大，心跳无法在空闲窗口内维持会话');
+  }
+  const ss = String(config.cookie.sameSite).toLowerCase();
+  if (!['lax', 'strict', 'none'].includes(ss)) {
+    errors.push('SESSION_COOKIE_SAMESITE 必须是 lax / strict / none 之一');
+  }
+  if (ss === 'none' && !config.cookie.secure) {
+    errors.push('SESSION_COOKIE_SAMESITE=none 必须同时设置 SESSION_COOKIE_SECURE=true');
   }
   return errors;
 }
