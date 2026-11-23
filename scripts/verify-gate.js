@@ -4,8 +4,11 @@
  * 用法：node scripts/verify-gate.js [baseUrl]
  */
 const crypto = require('node:crypto');
+require('../src/lib/fetch-global');
 
 const BASE = process.argv[2] || 'http://127.0.0.1:3000';
+// 会话改走 Cookie 后，POST /auth/login 必须带 Origin 通过 CSRF 校验
+const ORIGIN = new URL(BASE).origin;
 
 async function getMeta() {
   const r = await fetch(BASE + '/auth/public-key');
@@ -30,7 +33,7 @@ async function loginRaw(meta, username, password) {
   const t0 = process.hrtime.bigint();
   const r = await fetch(BASE + '/auth/login', {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', origin: ORIGIN },
     body: JSON.stringify({ encrypted: encrypt(meta, encodeLogin(username, password)) }),
   });
   const t1 = process.hrtime.bigint();
@@ -62,7 +65,7 @@ async function main() {
   console.log('\n2) 非法密文折叠');
   const badCt = crypto.randomBytes(256).toString('base64');
   const badRes = await fetch(BASE + '/auth/login', {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN },
     body: JSON.stringify({ encrypted: badCt }),
   });
   const badBody = await badRes.json();

@@ -11,6 +11,8 @@ const CODES = {
   TOKEN_INVALID: [401, '凭证无效'],
   TOKEN_EXPIRED: [401, '凭证已过期'],
   ACCOUNT_LOCKED: [403, '账号已被锁定'],
+  /** 会话改走 Cookie 后新增：状态变更请求的 Origin/Referer 不在白名单 */
+  CSRF_FORBIDDEN: [403, '请求来源不被允许'],
   TOO_MANY_ATTEMPTS: [429, '尝试过于频繁'],
   AUTH_BUSY: [429, '服务繁忙，请稍后重试'],
   SESSION_WRITE_FAILED: [503, '会话写入失败'],

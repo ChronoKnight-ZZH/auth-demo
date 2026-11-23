@@ -91,7 +91,7 @@
 <body>
 <div class="card">
   <h1>登录</h1>
-  <p class="sub">RSA-OAEP(SHA-256) 加密传输 · Argon2id 持久化 · Opaque Token</p>
+  <p class="sub">RSA-OAEP(SHA-256) 加密传输 · Argon2id 持久化 · Opaque Token + HttpOnly Cookie</p>
 
   <ol class="steps" aria-label="登录流程">
     <li class="step" id="step1" data-state="pending">
@@ -112,7 +112,7 @@
       <span class="step-index">3</span>
       <div class="step-body">
         <div class="step-title">验证凭证 <span class="badge" data-badge>等待</span></div>
-        <div class="step-detail" id="step3Detail">登录成功后携带 Token 请求 /auth/me</div>
+        <div class="step-detail" id="step3Detail">登录成功后由浏览器自动携带 HttpOnly Cookie 请求 /auth/me</div>
       </div>
     </li>
   </ol>
@@ -149,7 +149,7 @@
 
   var publicMeta = null; // { publicKey, algorithm, oaepHash, maxPlaintextBytes }
   var cryptoKey = null;  // WebCrypto RSA-OAEP 公钥
-  var token = null;
+  var loggedIn = false; // 会话凭证在 HttpOnly Cookie 中，前端只记录登录态
   var expiresAt = 0;
 
   var $f = document.getElementById('f');
@@ -232,7 +232,7 @@
   async function loadPublicKey() {
     publicMeta = null;
     cryptoKey = null;
-    token = null;
+    loggedIn = false;
     expiresAt = 0;
     setFormEnabled(false);
     $retryKey.hidden = true;
@@ -240,7 +240,7 @@
     show('', '');
     setStep(1, STEP_STATE.RUNNING, '正在请求 /auth/public-key…');
     setStep(2, STEP_STATE.PENDING, '提交后加密账号密码并 POST /auth/login');
-    setStep(3, STEP_STATE.PENDING, '登录成功后携带 Token 请求 /auth/me');
+    setStep(3, STEP_STATE.PENDING, '登录成功后由浏览器自动携带 HttpOnly Cookie 请求 /auth/me');
 
     try {
       var response = await fetch('/auth/public-key', { cache: 'no-store' });
@@ -285,10 +285,10 @@
     }
   }
 
-  // ---- 步骤 3：用登录拿到的 Token 调 /auth/me ----
+  // ---- 步骤 3：登录后由浏览器自动携带 HttpOnly Cookie 调 /auth/me ----
   async function verifyMe() {
-    if (!token) {
-      setStep(3, STEP_STATE.ERROR, '没有可用的 Token，请先登录');
+    if (!loggedIn) {
+      setStep(3, STEP_STATE.ERROR, '尚未登录，请先提交账号密码');
       $retryMe.hidden = true;
       return;
     }
@@ -297,7 +297,7 @@
     try {
       var response = await fetch('/auth/me', {
         cache: 'no-store',
-        headers: { authorization: 'Bearer ' + token }
+        credentials: 'same-origin'
       });
       var data = await readJson(response);
       if (!response.ok) throw httpError(response, data, '凭证验证失败');
@@ -309,7 +309,7 @@
       setStep(3, STEP_STATE.ERROR, describeError(err));
       show('凭证验证失败：' + describeError(err), 'err');
     } finally {
-      $retryMe.hidden = !token;
+      $retryMe.hidden = !loggedIn;
     }
   }
 
@@ -324,7 +324,7 @@
     show('', '');
     setFormEnabled(false);
     $retryMe.hidden = true;
-    setStep(3, STEP_STATE.PENDING, '登录成功后携带 Token 请求 /auth/me');
+    setStep(3, STEP_STATE.PENDING, '登录成功后由浏览器自动携带 HttpOnly Cookie 请求 /auth/me');
     setStep(2, STEP_STATE.RUNNING, '正在加密并发送 POST /auth/login…');
 
     try {
@@ -347,24 +347,25 @@
       var response = await fetch('/auth/login', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
+        credentials: 'same-origin',
         body: JSON.stringify({ encrypted: encrypted })
       });
       var data = await readJson(response);
       if (!response.ok) throw httpError(response, data, '登录失败');
-      if (!data || typeof data.token !== 'string' || !data.token) {
-        throw new Error('登录响应缺少 token');
+      // 会话凭证由服务端 Set-Cookie（HttpOnly）下发，响应体只有 username/expiresAt
+      if (!data || typeof data.username !== 'string' || !data.username) {
+        throw new Error('登录响应缺少 username');
       }
 
-      token = data.token;
+      loggedIn = true;
       expiresAt = Number(data.expiresAt) || 0;
-      // Demo 后端使用 Bearer Token；不是 httpOnly Cookie
-      sessionStorage.setItem('token', token);
 
       setStep(2, STEP_STATE.DONE,
         'HTTP ' + response.status +
         ' · 明文 ' + payload.length + ' 字节' +
         ' · 密文 ' + encrypted.length + ' 字符（Base64）' +
-        '\nToken：' + token.slice(0, 16) + '…（已截断）' +
+        '\n账号：' + data.username +
+        '（会话凭证已写入 HttpOnly Cookie，前端不可读）' +
         '\n过期时间：' + (expiresAt ? new Date(expiresAt).toISOString() : '未返回'));
 
       // 密码已经用完，避免继续留在输入框里
@@ -377,7 +378,7 @@
       show('登录失败：' + describeError(err), 'err');
     } finally {
       setFormEnabled(Boolean(publicMeta && cryptoKey));
-      $retryMe.hidden = !token;
+      $retryMe.hidden = !loggedIn;
     }
   });
 

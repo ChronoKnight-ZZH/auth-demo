@@ -2,14 +2,14 @@
 /**
  * 附件原件路由（里程碑 3）。
  *
- *   POST   /files/originals                 流式上传原件（Bearer）
- *   GET    /files/originals/:id/url         按会话签发 p/r 票据（Bearer）
- *   DELETE /files/originals/:id             软删除原件（Bearer）
- *   GET    /files/content?file_id&state&ty  凭票据读取原件（无需 Header）
+ *   POST   /files/originals                 流式上传原件（登录态 / HttpOnly Cookie）
+ *   GET    /files/originals/:id/url         按会话签发 p/r 票据（登录态 / HttpOnly Cookie）
+ *   DELETE /files/originals/:id             软删除原件（登录态 / HttpOnly Cookie）
+ *   GET    /files/content?file_id&state&ty  凭票据读取原件（无需 Cookie/Header）
  *
- * `/files/content` 之所以不要求 Authorization，是因为 <img src> 无法携带
- * Bearer 头。票据本身是能力凭证：绑定 uid + sid，读取时仍会回查文件归属
- * 与会话存活，越权与不存在统一返回 404。
+ * `/files/content` 走查询票据而非 Cookie，是因为 <img src>/<a download> 在分域部署下
+ * 不一定能带上 HttpOnly Cookie（跨源/第三方 Cookie 限制）。票据本身是能力凭证：
+ * 绑定 uid + sid，读取时仍会回查文件归属与会话存活，越权与不存在统一返回 404。
  */
 const crypto = require('node:crypto');
 const fsPromises = require('node:fs/promises');

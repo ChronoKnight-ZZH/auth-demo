@@ -5,7 +5,7 @@
   "description": "后端登录与凭证验证 Demo：RSA-OAEP 传输 + Argon2id 持久化 + Opaque Token 版本化会话",
   "main": "src/server.js",
   "engines": {
-    "node": ">=20"
+    "node": ">=16.17.0"
   },
   "scripts": {
     "keys": "node scripts/gen-keys.js",
@@ -25,19 +25,20 @@
     "dev": "node src/server.js",
     "mock:upstream": "node scripts/mock-upstream.js",
     "mock:echo": "node scripts/echo-upstream.js",
-    "test": "node test/unit.test.js && node --test test/stream.test.js && node test/cors.test.js",
+    "test": "node test/unit.test.js && node test/stream.test.js && node test/cors.test.js",
     "smoke": "node scripts/smoke.js",
     "smoke:stream": "node scripts/smoke-stream.js",
     "smoke:echo": "node scripts/smoke-echo.js",
-    "test:echo": "node --test --test-timeout=25000 test/echo-upstream.test.js",
+    "test:echo": "node test/echo-upstream.test.js",
     "verify:gate": "node scripts/verify-gate.js",
     "verify:webcrypto": "node scripts/verify-webcrypto.js",
-    "verify:all": "node test/unit.test.js && node --test test/stream.test.js && node --test --test-timeout=25000 test/echo-upstream.test.js && node scripts/smoke.js && node scripts/smoke-stream.js && node scripts/smoke-echo.js && node scripts/verify-gate.js && node scripts/verify-webcrypto.js"
+    "verify:all": "node test/unit.test.js && node test/stream.test.js && node test/echo-upstream.test.js && node scripts/smoke.js && node scripts/smoke-stream.js && node scripts/smoke-echo.js && node scripts/verify-gate.js && node scripts/verify-webcrypto.js"
   },
   "dependencies": {
     "argon2": "^0.41.1",
     "express": "^5.1.0",
     "ioredis": "^5.4.1",
-    "mysql2": "^3.11.4"
+    "mysql2": "^3.11.4",
+    "undici": "^5.28.0"
   }
 }

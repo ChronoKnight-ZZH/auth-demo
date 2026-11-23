@@ -3,6 +3,9 @@
  * 分域部署集成检查：内存后端 + CORS_ORIGINS 场景下，
  * 登录 → 上传原件 → 换票 → 读取 content 全链路的 CORS/CORP 头。
  * 用法：node scripts/smoke-corp.js（独立内存环境，不碰 MySQL/Redis）
+ *
+ * 会话改走 HttpOnly Cookie：本脚本用 createFetcher 维护 Cookie Jar，
+ * 登录后 Set-Cookie 自动在后续请求携带；状态变更请求带 Origin 通过 CSRF。
  */
 process.env.NODE_ENV = 'production';
 process.env.PEPPER = 'corp-smoke-pepper-0123456789';
@@ -15,6 +18,8 @@ process.env.PORT = '3111';
 process.env.HOST = '127.0.0.1';
 
 const crypto = require('node:crypto');
+require('../src/lib/fetch-global');
+const { createFetcher } = require('./_client');
 const { createApp } = require('../src/app');
 
 const BASE = 'http://127.0.0.1:3111';
@@ -47,26 +52,25 @@ async function main() {
   const ctx = await createApp();
   const server = ctx.app.listen(3111, '127.0.0.1');
   await new Promise((r) => server.once('listening', r));
+  const F = createFetcher(BASE);
   try {
-    const pk = await (await fetch(BASE + '/auth/public-key')).json();
+    const pk = await (await F.fetch('/auth/public-key')).json();
     pubKey = pk.publicKey;
     oaepHash = pk.oaepHash;
 
-    const login = await fetch(BASE + '/auth/login', {
+    // 登录显式带 Origin: CHAT，验证分域 CORS 头回显；Cookie 由 Jar 捕获
+    const login = await F.fetch('/auth/login', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', Origin: CHAT },
+      headers: { 'content-type': 'application/json', origin: CHAT },
       body: JSON.stringify({ encrypted: encryptLogin('alice', 'Alice@Passw0rd') }),
     });
     check('分域登录成功且回 CORS 头', login.status === 200 &&
       login.headers.get('access-control-allow-origin') === CHAT &&
       login.headers.get('access-control-allow-credentials') === 'true',
       `status=${login.status}`);
-    const token = (await login.json()).token;
 
-    // 建一个会话：/auth/me 拿 userId，直接落内存 chatRepo（等价于业务侧保存会话）
-    const me = await (
-      await fetch(BASE + '/auth/me', { headers: { authorization: `Bearer ${token}` } })
-    ).json();
+    // 建一个会话：/auth/me 拿 userId（靠 Cookie），直接落内存 chatRepo
+    const me = await (await F.fetch('/auth/me')).json();
     const userId = me.userId;
     const session = await ctx.chatRepo.saveSession(userId, {
       id: 'corp-smoke-session',
@@ -78,15 +82,14 @@ async function main() {
     const sessionId = session && session.id;
     check('获得会话 id', Boolean(sessionId), String(sessionId));
 
-    // 上传原件（1x1 PNG）
+    // 上传原件（1x1 PNG）—— 靠 Cookie 鉴权，fetcher 自动带 Origin 过 CSRF
     const png = Buffer.from(
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
       'base64'
     );
-    const up = await fetch(BASE + '/v1/files/originals', {
+    const up = await F.fetch('/v1/files/originals', {
       method: 'POST',
       headers: {
-        authorization: `Bearer ${token}`,
         'content-type': 'image/png',
         'x-file-name': encodeURIComponent('a.png'),
         'x-file-mime': 'image/png',
@@ -96,9 +99,8 @@ async function main() {
     const upJson = await up.json().catch(() => ({}));
     check('上传原件成功（含自定义头预检语义）', (up.status === 200 || up.status === 201) && upJson.fileId, `status=${up.status}`);
 
-    const urlRes = await fetch(
-      `${BASE}/v1/files/originals/${upJson.fileId}/url?sessionId=${sessionId}`,
-      { headers: { authorization: `Bearer ${token}` } }
+    const urlRes = await F.fetch(
+      `/v1/files/originals/${upJson.fileId}/url?sessionId=${sessionId}`
     );
     const urlSet = await urlRes.json().catch(() => ({}));
     check('换票成功', urlRes.status === 200 && urlSet.urls && urlSet.urls.p, `status=${urlRes.status}`);

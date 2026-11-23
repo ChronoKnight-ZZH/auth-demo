@@ -90,10 +90,11 @@ EOF
 
 ## 备选路线(不推荐,仅备查)
 
-- **留在 Node 16 + undici 兼容层**:新增 `src/lib/http-client.js`(约 20 行,
-  `typeof fetch === 'undefined'` 时回退 `require('undici').fetch`,proxy.js 的
-  `Readable.fromWeb` 加手写兜底)。可行,但把项目永久钉死在 EOL 运行时上,
-  且 Node 16 的 TLS/HTTP 栈已多年无安全更新 —— 用于登录系统尤其不合适。
+- **留在 Node 16 + undici 兼容层**:仓库已内置该兼容层(见 README「Node 16 兼容」:
+  `src/lib/fetch-global.js` 仅在 Node < 18 时加载 undici@5,`proxy.js` 对
+  `Readable.fromWeb` 有手写兜底,测试侧兼容了 Node 16 的 `node:test`)。可用,
+  但仍不推荐:Node 16 已 EOL,且 Node 16 的 TLS/HTTP 栈已多年无安全更新 ——
+  用于登录系统尤其不合适。
 - **容器**:CentOS 7 上跑 docker 镜像(node:20-alpine),彻底绕开 glibc,但引入容器栈。
 - **换系统**:Rocky 8/9、Debian 10+ 直接 NodeSource 装 Node 20/22,glibc 天然满足。
 

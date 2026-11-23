@@ -6,8 +6,9 @@
  * 规则：
  * - CORS_ORIGINS 未配置（空）：同源反代部署，完全不加头，行为与之前一致。
  * - 请求带 Origin 且在白名单内：回显该 Origin + Allow-Credentials，并暴露 Retry-After。
- * - CORS_ORIGINS 含 `*`：反射任意 Origin（鉴权靠 Bearer Token 头，不依赖 Cookie，
- *   反射不带来 CSRF 会话风险；生产仍建议写显式白名单）。
+ * - CORS_ORIGINS 含 `*`：反射任意 Origin。注意：会话已改走 HttpOnly Cookie，
+ *   浏览器携带 Cookie 要求 Allow-Credentials=true，而规范禁止 `*` + credentials 共存，
+ *   故分域部署必须写显式白名单（不可用 `*`）；CSRF 防护也依赖该白名单。
  * - Origin 不在白名单：不加任何 CORS 头，浏览器自行拦截（OPTIONS 直接 403）。
  * - 无 Origin（同源请求、curl、健康检查、<img> 加载）：不加头，请求正常处理。
  */

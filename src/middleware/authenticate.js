@@ -12,9 +12,16 @@ const { config } = require('../config');
 
 function createAuthenticate(sessionStore) {
   return async function authenticate(req, res, next) {
-    const header = req.headers.authorization || '';
-    if (!header.startsWith('Bearer ')) return sendError(res, 'TOKEN_MISSING');
-    const token = header.slice(7).trim();
+    // 优先从 HttpOnly Cookie 取 token（主路径）；
+    // 回退 Authorization: Bearer 仅作 CLI / 旧客户端的过渡兼容，前端不再发送该头。
+    let token = '';
+    const cookieToken = req.cookies && req.cookies[config.cookie.name];
+    if (cookieToken) {
+      token = cookieToken;
+    } else {
+      const header = req.headers.authorization || '';
+      if (header.startsWith('Bearer ')) token = header.slice(7).trim();
+    }
     if (!token) return sendError(res, 'TOKEN_MISSING');
 
     const tokenHash = hashToken(token);
@@ -55,6 +62,7 @@ function createAuthenticate(sessionStore) {
 
     req.userId = session.userId;
     req.tokenHash = tokenHash;
+    req.sessionExpiresAt = session.absoluteExpiresAt;
     /**
      * 供长连接（SSE）自行维持会话：一条流可能跑过空闲窗口，
      * 若期间不续期，重连续推会被判定为「凭证失效」，属于误伤。
