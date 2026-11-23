@@ -12,6 +12,7 @@ const { createCors } = require('./middleware/cors');
 const { createAuthenticate } = require('./middleware/authenticate');
 const { createAuthService } = require('./services/auth-service');
 const { createRoutes } = require('./routes/auth');
+const { createBalanceRoutes } = require('./routes/balance');
 const { createChatRoutes } = require('./routes/chat');
 const { createProxyRoutes } = require('./routes/proxy');
 const { createSessionRoutes } = require('./routes/sessions');
@@ -183,6 +184,8 @@ async function createApp() {
   });
 
   app.use('/auth', createRoutes({ authService, authenticate }));
+  // 账户余额：前端用自身 Bearer 鉴权，上游 Key 留在服务端
+  app.use('/', createBalanceRoutes({ authenticate }));
   // 原件路由必须先于其他 /v1 路由：/files/content 靠票据鉴权，不能先被
   // 会话路由的 router.use(authenticate) 拦成 TOKEN_MISSING
   if (fileRepo) {

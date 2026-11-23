@@ -25,9 +25,14 @@ const MIME_BY_EXT = {
   bmp: 'image/bmp',
   pdf: 'application/pdf',
   txt: 'text/plain',
+  log: 'text/plain',
   md: 'text/markdown',
   csv: 'text/csv',
+  tsv: 'text/tab-separated-values',
   json: 'application/json',
+  xml: 'application/xml',
+  yml: 'application/yaml',
+  yaml: 'application/yaml',
   zip: 'application/zip',
   doc: 'application/msword',
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -132,6 +137,23 @@ async function detect(filePath, { name = '', declared = '' } = {}) {
   return { mime: 'application/octet-stream', isImage: false };
 }
 
-const isInlineImage = (mime) => IMAGE_EXT.has(mime);
+/**
+ * 可以安全地当纯文本内联展示的类型。响应时统一发 text/plain; charset=utf-8，
+ * 因为 text/csv、text/markdown 等子类型在多数浏览器里仍会触发下载。
+ */
+const TEXT_MIME = new Set([
+  'text/plain',
+  'text/markdown',
+  'text/csv',
+  'text/tab-separated-values',
+  'application/json',
+  'application/xml',
+  'text/xml',
+  'application/yaml',
+  'application/x-yaml',
+]);
 
-module.exports = { detect, sniff, sanitizeDeclared, isInlineImage, extOf };
+const isInlineImage = (mime) => IMAGE_EXT.has(mime);
+const isTextual = (mime) => TEXT_MIME.has(mime);
+
+module.exports = { detect, sniff, sanitizeDeclared, isInlineImage, isTextual, extOf };

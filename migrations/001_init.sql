@@ -14,3 +14,11 @@ CREATE TABLE IF NOT EXISTS users (
   PRIMARY KEY (id),
   UNIQUE KEY uk_users_username (username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 初始管理员账号：admin / 123456
+-- password_hash 为 Argon2id PHC 字符串（m=19456, t=2, p=1），
+-- 由 PEPPER=dev-pepper-change-me-in-production-0123456789 生成。
+-- 注意：该哈希与 PEPPER 强绑定，运行时 PEPPER 不一致将无法登录；
+-- 生产环境请按实际注入的 PEPPER 重新生成后替换。
+INSERT IGNORE INTO users (username, password_hash)
+VALUES ('admin', '$argon2id$v=19$m=19456,t=2,p=1$wUldh2oxAwZUnuIZnVygGQ$FIhU6uGStuAqOmmzJjKyCJ//ylFxwlk+Zhi7YjsYKfw');

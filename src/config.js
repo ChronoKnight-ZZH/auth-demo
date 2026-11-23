@@ -111,6 +111,10 @@ const config = {
     filesPath: process.env.UPSTREAM_FILES_PATH || '/anthropic/v1/files',
     asrPath: process.env.UPSTREAM_ASR_PATH || '/v1/tools/asr',
     ttsPath: process.env.UPSTREAM_TTS_PATH || '/v1/tools/tts',
+    /** 账户余额查询（GET /user/balance） */
+    balancePath: process.env.UPSTREAM_BALANCE_PATH || '/user/balance',
+    /** 余额查询总时限：只读小请求，不应和聊天共用 10 分钟 */
+    balanceTimeoutMs: int('UPSTREAM_BALANCE_TIMEOUT_MS', 15_000),
     /** 首字节（响应头）超时 */
     headersTimeoutMs: int('UPSTREAM_HEADERS_TIMEOUT_MS', 30_000),
     /** 相邻两个数据块之间的静默超时（比总超时更适合流式） */
@@ -176,6 +180,8 @@ const config = {
     dir: process.env.FILES_DIR || path.join(__dirname, '..', 'data', 'files'),
     /** 单文件上限，与前端 MAX_SIZE_MB 对齐 */
     maxBytes: int('FILES_MAX_BYTES', 64 * 1024 * 1024),
+    /** 文本内联预览的转码上限：超过此大小的文本仍按附件下载，避免大文件占满内存 */
+    textMaxBytes: int('FILES_TEXT_MAX_BYTES', 16 * 1024 * 1024),
     /** 票据 HMAC 密钥；缺省时用 PEPPER 派生（仅本地开发） */
     tokenSecret: process.env.FILE_TOKEN_SECRET || '',
     tokenTtlMs: int('FILE_TOKEN_TTL_MS', 30 * 60 * 1000),

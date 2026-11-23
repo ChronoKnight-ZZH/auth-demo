@@ -176,6 +176,7 @@ BFF（浏览器不再持有上游 Key）：
 | `GET` | `/v1/chat/stream` | Bearer | 只读续推：`?requestId=&cursor=` |
 | `POST` | `/v1/chat/stop` | Bearer | 停止自己的流；返回 `{ ok, stopped }` |
 | `GET` | `/v1/models` | Bearer | 上游连通性探测 |
+| `GET` | `/user/balance` | Bearer | 查询上游账户余额；上游 Key 只留在服务端，响应原样透传 |
 | `POST` | `/v1/files` | Bearer | 附件 multipart 透传到上游 Files API |
 | `DELETE` | `/v1/files/:fileId` | Bearer | 删除上游文件 |
 | `POST` | `/v1/tools/asr` | Bearer | 语音识别代理（≤8MB） |
@@ -208,6 +209,34 @@ BFF（浏览器不再持有上游 Key）：
 
 两者都用长度前缀，**不要**用 `||` 等分隔符拼接。
 
+### 账户余额
+
+```http
+GET /user/balance
+Authorization: Bearer <前端登录 Token>
+```
+
+服务端用 `UPSTREAM_API_KEY` 请求 `UPSTREAM_BASE_URL + /user/balance`，响应体原样透传：
+
+```json
+{
+  "is_available": true,
+  "balance_infos": [
+    {
+      "currency": "CNY",
+      "total_balance": "110.00",
+      "granted_balance": "10.00",
+      "topped_up_balance": "100.00"
+    }
+  ]
+}
+```
+
+- 每次实时查询，`Cache-Control: no-store`；上游 Key 不出网关。
+- 上游 401/403 折叠为 `502 UPSTREAM_REJECTED`，**不会**返回 401 —— 避免前端把「上游 Key 失效」误判成用户登录态过期。
+- 上游 429 → `429 UPSTREAM_RATE_LIMITED`；5xx/网络异常 → `502 UPSTREAM_ERROR`；超时 → `504 UPSTREAM_TIMEOUT`；未配置 Key → `503 UPSTREAM_NOT_CONFIGURED`。
+- 默认 15s 超时（`UPSTREAM_BALANCE_TIMEOUT_MS`），路径可用 `UPSTREAM_BALANCE_PATH` 覆盖。
+
 ## 附件原件存储（里程碑 3）
 
 浏览器 IndexedDB 只是缓存；**服务端保存原件**，换设备/清缓存后仍能显示和下载。
@@ -222,8 +251,11 @@ BFF（浏览器不再持有上游 Key）：
   按会话签发 HMAC 票据（默认 30 min），`GET /v1/files/content` 只验票据，并回查
   **文件归属 + 会话存活**；跨用户与不存在统一 404，篡改/过期统一 403。
 - **票据不入库**：不写进会话 JSON，前端只缓存到过期前；图片加载失败时重签一次。
-- **安全响应头**：`X-Content-Type-Options: nosniff`、`Content-Security-Policy: sandbox`、
-  非图片一律 `attachment` + `application/octet-stream`；MIME 以文件头嗅探为准，
+- **安全响应头**：`X-Content-Type-Options: nosniff`、`Content-Security-Policy: sandbox`；
+  图片按原件 MIME 内联；文本（txt/md/csv/json/xml，≤ `FILES_TEXT_MAX_BYTES`）在服务端
+  统一转成 UTF-8（自动识别 GB18030/GBK、UTF-8/UTF-16 BOM）后以
+  `text/plain; charset=utf-8` + `inline` 返回，浏览器直接预览而不是下载；
+  其余非图片一律 `attachment` + `application/octet-stream`。MIME 以文件头嗅探为准，
   伪装成 `image/svg+xml` 等会被降级为二进制，避免 XSS。
 - **限制**：单文件默认 64 MiB（`FILES_MAX_BYTES`），与前端 `MAX_SIZE_MB` 对齐；
   存储键只由服务端生成，拒绝任何含路径分隔符的输入。
@@ -232,13 +264,14 @@ BFF（浏览器不再持有上游 Key）：
 FILES_MODE=local                 # off = 关闭服务端原件，前端退回纯 IndexedDB
 FILES_DIR=/data/deepseek/files   # 生产挂载独立磁盘
 FILES_MAX_BYTES=67108864
+FILES_TEXT_MAX_BYTES=16777216    # 文本内联预览的转码上限，超出仍按附件下载
 FILE_TOKEN_SECRET=<强随机值>      # 未设置时用 PEPPER 派生，仅限本地开发
 FILE_TOKEN_TTL_MS=1800000
 DEDUPE_SCOPE=global              # global | user
 ```
 
 > 缩略图生成、病毒扫描、物理块 GC 均未实现：软删除只影响元数据，已上传的 blob
-> 需后续离线清理任务回收。文件预览当前只支持图片（浏览器内弹窗），文档只提供下载。
+> 需后续离线清理任务回收。文件预览支持图片与文本（服务端转 UTF-8），其他文档只提供下载。
 
 ## 账号管理（CLI）
 

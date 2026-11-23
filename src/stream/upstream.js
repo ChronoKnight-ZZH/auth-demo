@@ -146,6 +146,80 @@ async function openStream(body, opts = {}) {
   return { response, stop, noteActivity };
 }
 
+/**
+ * GET /user/balance：查询账户余额（只读、不产生费用）。
+ *
+ * 失败一律转成 UpstreamError：上游 401/403 不能被前端误判为「自己的 Token 失效」，
+ * 路由层据 err.code / err.upstreamStatus 映射成本项目的错误码。
+ *
+ * @param {object} opts { signal }
+ * @returns {Promise<object>} 上游 GetUserBalanceResponse 原样 JSON
+ */
+async function getBalance(opts = {}) {
+  if (!config.upstream.apiKey) {
+    const e = new UpstreamError('UPSTREAM_NOT_CONFIGURED', 'UPSTREAM_API_KEY not set', { retryable: false });
+    e.appCode = 'UPSTREAM_NOT_CONFIGURED';
+    throw e;
+  }
+
+  const controller = new AbortController();
+  const callerSignal = opts.signal;
+  if (callerSignal) {
+    if (callerSignal.aborted) controller.abort(callerSignal.reason);
+    else callerSignal.addEventListener('abort', () => controller.abort(callerSignal.reason), { once: true });
+  }
+
+  let timedOut = null;
+  const timer = setTimeout(() => {
+    timedOut = new UpstreamError('UPSTREAM_TIMEOUT', 'upstream balance timeout', { retryable: true });
+    controller.abort(timedOut);
+  }, config.upstream.balanceTimeoutMs);
+  timer.unref?.();
+
+  let response;
+  try {
+    response = await fetch(config.upstream.baseUrl + config.upstream.balancePath, {
+      method: 'GET',
+      headers: {
+        // Key 只出现在这一跳；响应体只有余额字段
+        Authorization: `Bearer ${config.upstream.apiKey}`,
+        Accept: 'application/json',
+      },
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (timedOut) throw timedOut;
+    if (callerSignal?.aborted) {
+      throw new UpstreamError('ABORTED', 'client aborted', { retryable: false, cause: err });
+    }
+    throw new UpstreamError('UPSTREAM_ERROR', `upstream network error: ${err.message}`, {
+      retryable: true, cause: err,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!response.ok) {
+    response.body?.cancel().catch(() => {});
+    throw classifyHttpStatus(response.status);
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch (err) {
+    throw new UpstreamError('UPSTREAM_ERROR', 'upstream balance is not valid json', {
+      retryable: false, upstreamStatus: response.status, cause: err,
+    });
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new UpstreamError('UPSTREAM_ERROR', 'upstream balance has unexpected shape', {
+      retryable: false, upstreamStatus: response.status,
+    });
+  }
+  return data;
+}
+
 /** GET /models：不产生费用的连通性探测（健康检查用） */
 async function probe(opts = {}) {
   if (!config.upstream.apiKey) {
@@ -168,4 +242,4 @@ async function probe(opts = {}) {
   }
 }
 
-module.exports = { UpstreamError, openStream, probe, isUpstreamRetryable };
+module.exports = { UpstreamError, openStream, probe, getBalance, isUpstreamRetryable };

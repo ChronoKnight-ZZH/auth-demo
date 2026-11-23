@@ -19,6 +19,7 @@ const { sendError } = require('../lib/errors');
 const blobStore = require('../files/blob-store');
 const fileToken = require('../files/token');
 const mimeSniff = require('../files/mime');
+const textFile = require('../files/text');
 
 const ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const TYPES = new Set(['t', 'p', 'r']);
@@ -44,8 +45,7 @@ function asciiFallback(name) {
   return name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_') || 'file';
 }
 
-function contentDisposition(type, file) {
-  const inline = type !== 'r' && mimeSniff.isInlineImage(file.mime);
+function contentDisposition(file, inline) {
   const kind = inline ? 'inline' : 'attachment';
   const name = cleanName(file.name);
   // RFC 5987 attr-char：encodeURIComponent 未转义的 '()*! 需要补上
@@ -179,19 +179,42 @@ function createFileRoutes({ fileRepo, chatRepo, authenticate }) {
     const blob = await blobStore.stat(file.storageKey);
     if (!blob) return sendError(res, 'FILE_ACCESS_DENIED');
 
-    res.setHeader('Content-Type', mimeSniff.isInlineImage(file.mime) && type !== 'r'
-      ? file.mime
-      : 'application/octet-stream');
-    res.setHeader('Content-Disposition', contentDisposition(type, file));
+    // 公共安全头：文本与图片都内联返回，必须禁止嗅探与脚本执行
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Security-Policy', 'sandbox');
     res.setHeader('Referrer-Policy', 'same-origin');
     res.setHeader('X-Robots-Tag', 'noindex');
-    // 下载不缓存；内联图片缓存 60s，删除会话后最多 1 分钟内仍可能命中浏览器缓存
-    res.setHeader('Cache-Control', type === 'r' ? 'private, no-store' : 'private, max-age=60');
     // 分域部署（chat.X 页面内嵌 api.X 图片）时 same-origin 会被 CORP 拦死；
     // 由 FILES_CORP / CORS_ORIGINS 决定，见 config.files.corp
     res.setHeader('Cross-Origin-Resource-Policy', config.files.corp);
+
+    // 文本预览：服务端统一转 UTF-8 后以 text/plain 内联，避免浏览器把
+    // .txt/.md/.csv 等当附件下载。仅 p/t 票据；r 票据保持下载语义。
+    // 转码会改变字节长度，因此这条路径不提供 Range，ETag 带上编码标记。
+    if (type !== 'r' && mimeSniff.isTextual(file.mime) && blob.size <= config.files.textMaxBytes) {
+      const prepared = await textFile.transcodeToUtf8(blob.path, {
+        maxBytes: config.files.textMaxBytes,
+      });
+      if (prepared) {
+        const etag = `"${file.sha256}-${file.size}-${prepared.encoding}"`;
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Content-Disposition', contentDisposition(file, true));
+        res.setHeader('Cache-Control', 'private, max-age=60');
+        res.setHeader('ETag', etag);
+        if (req.headers['if-none-match'] === etag) {
+          return res.status(304).end();
+        }
+        res.setHeader('Content-Length', String(prepared.body.length));
+        return res.end(prepared.body);
+      }
+      // 读取失败或超限：退回下面的附件下载语义
+    }
+
+    const inlineImage = type !== 'r' && mimeSniff.isInlineImage(file.mime);
+    res.setHeader('Content-Type', inlineImage ? file.mime : 'application/octet-stream');
+    res.setHeader('Content-Disposition', contentDisposition(file, inlineImage));
+    // 下载不缓存；内联图片缓存 60s，删除会话后最多 1 分钟内仍可能命中浏览器缓存
+    res.setHeader('Cache-Control', type === 'r' ? 'private, no-store' : 'private, max-age=60');
     res.setHeader('ETag', `"${file.sha256}-${file.size}"`);
     res.setHeader('Accept-Ranges', 'bytes');
 

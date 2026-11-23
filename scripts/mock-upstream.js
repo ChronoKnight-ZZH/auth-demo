@@ -57,6 +57,24 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ data: [{ id: 'deepseek-v4-flash' }, { id: 'deepseek-v4-pro' }] }));
   }
 
+  // 账户余额：仅检查 Key，返回与 DeepSeek 同形的余额结构
+  if (req.method === 'GET' && req.url === '/user/balance') {
+    if (!req.headers.authorization) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: 'missing api key' } }));
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({
+      is_available: true,
+      balance_infos: [{
+        currency: 'CNY',
+        total_balance: '110.00',
+        granted_balance: '10.00',
+        topped_up_balance: '100.00',
+      }],
+    }));
+  }
+
   if (req.method === 'GET' && req.url === '/__calls') {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({ calls }));

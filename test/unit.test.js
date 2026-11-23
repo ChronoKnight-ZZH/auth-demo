@@ -10,6 +10,8 @@ const crypto = require('node:crypto');
 process.env.PEPPER = process.env.PEPPER || 'test-pepper-0123456789abcdef';
 process.env.RSA_PRIVATE_KEY_PATH = process.env.RSA_PRIVATE_KEY_PATH || 'secrets/rsa_private.pem';
 process.env.RSA_PUBLIC_KEY_PATH = process.env.RSA_PUBLIC_KEY_PATH || 'secrets/rsa_public.pem';
+// 余额查询单测需要 config.upstream.apiKey；不发起真实请求（fetch 会被替换）
+process.env.UPSTREAM_API_KEY = process.env.UPSTREAM_API_KEY || 'sk-test-unit-balance';
 
 const {
   decryptCredentials, encodePayload, decodePayload,
@@ -27,6 +29,7 @@ const { createRateLimiter } = require('../src/lib/rate-limiter');
 const { config } = require('../src/config');
 const fileToken = require('../src/files/token');
 const mimeSniff = require('../src/files/mime');
+const textFile = require('../src/files/text');
 const blobStore = require('../src/files/blob-store');
 const { ZipArchive } = require('../src/import/zip-reader');
 const {
@@ -36,6 +39,7 @@ const {
 } = require('../src/import/history');
 const { importArchive } = require('../src/import/import-history');
 const { createAdminService } = require('../src/account/admin-service');
+const { getBalance } = require('../src/stream/upstream');
 const { makeZip } = require('./helpers/zip');
 const fs = require('node:fs/promises');
 const os = require('node:os');
@@ -341,6 +345,61 @@ test('MIME 嗅探：图片以文件头为准，伪装 SVG/HTML 降级为二进�
       { mime: 'application/octet-stream', isImage: false },
       '扩展名声称图片但内容不是已知图片时不能当图片内联'
     );
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('文本原件：UTF-8 原样返回，GB18030 / UTF-16 统一转 UTF-8', async () => {
+  assert.strictEqual(mimeSniff.isTextual('text/plain'), true);
+  assert.strictEqual(mimeSniff.isTextual('text/markdown'), true);
+  assert.strictEqual(mimeSniff.isTextual('application/json'), true);
+  assert.strictEqual(mimeSniff.isTextual('image/png'), false);
+  assert.strictEqual(mimeSniff.isTextual('application/octet-stream'), false);
+
+  const utf8 = Buffer.from('中文 UTF-8\n', 'utf8');
+  assert.deepStrictEqual(textFile.convert(utf8), { body: utf8, encoding: 'utf-8' });
+
+  const bom = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('带 BOM', 'utf8')]);
+  assert.deepStrictEqual(textFile.convert(bom), {
+    body: Buffer.from('带 BOM', 'utf8'),
+    encoding: 'utf-8',
+  });
+
+  // GBK/GB18030（Windows 记事本「ANSI」）字节：中文测试
+  const gbk = Buffer.from([0xd6, 0xd0, 0xce, 0xc4, 0xb2, 0xe2, 0xca, 0xd4]);
+  assert.deepStrictEqual(textFile.convert(gbk), {
+    body: Buffer.from('中文测试', 'utf8'),
+    encoding: 'gb18030',
+  });
+
+  const utf16 = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('中文测试', 'utf16le')]);
+  assert.deepStrictEqual(textFile.convert(utf16), {
+    body: Buffer.from('中文测试', 'utf8'),
+    encoding: 'utf-16le',
+  });
+
+  // 无 BOM 的 UTF-16LE：NUL 分布可识别
+  assert.deepStrictEqual(textFile.convert(Buffer.from('hello', 'utf16le')), {
+    body: Buffer.from('hello', 'utf8'),
+    encoding: 'utf-16le',
+  });
+
+  // 既非 UTF-8 也非东亚双字节的拉丁文本走 windows-1252 兜底
+  assert.deepStrictEqual(textFile.convert(Buffer.from([0x63, 0x61, 0x66, 0xe9])), {
+    body: Buffer.from('café', 'utf8'),
+    encoding: 'windows-1252',
+  });
+
+  // 超过转码上限时不读入内存，由路由退回下载语义
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'auth-text-'));
+  try {
+    const filePath = path.join(dir, 'big.txt');
+    await fs.writeFile(filePath, Buffer.from('0123456789'));
+    assert.strictEqual(await textFile.transcodeToUtf8(filePath, { maxBytes: 4 }), null);
+    const ok = await textFile.transcodeToUtf8(filePath, { maxBytes: 16 });
+    assert.strictEqual(ok.body.toString('utf8'), '0123456789');
+    assert.strictEqual(ok.encoding, 'utf-8');
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
@@ -783,5 +842,50 @@ test('管理员账号：创建、锁定、解锁与重置密码', async () => {
   } finally {
     await sessionStore.close();
     await userRepo.close();
+  }
+});
+
+test('余额查询：GET /user/balance 透传上游结构且带上服务端 Key', async () => {
+  const originalFetch = global.fetch;
+  const calls = [];
+  global.fetch = async (url, opts) => {
+    calls.push({ url, opts });
+    return new Response(JSON.stringify({
+      is_available: true,
+      balance_infos: [{
+        currency: 'CNY',
+        total_balance: '110.00',
+        granted_balance: '10.00',
+        topped_up_balance: '100.00',
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const data = await getBalance();
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].url, config.upstream.baseUrl + config.upstream.balancePath);
+    assert.strictEqual(calls[0].opts.method, 'GET');
+    assert.strictEqual(calls[0].opts.headers.Authorization, `Bearer ${config.upstream.apiKey}`);
+    assert.strictEqual(data.is_available, true);
+    assert.strictEqual(data.balance_infos[0].total_balance, '110.00');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('余额查询：上游 401 折叠为 UPSTREAM_REJECTED，不暴露成 401', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => new Response('{"error":{"message":"bad key"}}', {
+    status: 401,
+    headers: { 'content-type': 'application/json' },
+  });
+  try {
+    await assert.rejects(getBalance(), (error) => {
+      assert.strictEqual(error.code, 'UPSTREAM_REJECTED');
+      assert.strictEqual(error.upstreamStatus, 401);
+      return true;
+    });
+  } finally {
+    global.fetch = originalFetch;
   }
 });

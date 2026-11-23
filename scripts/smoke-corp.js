@@ -124,6 +124,53 @@ async function main() {
       content2.headers.get('access-control-allow-origin') === CHAT,
       `aco=${content2.headers.get('access-control-allow-origin')}`
     );
+
+    // 文本原件：GB18030（Windows 记事本 ANSI）上传后应转 UTF-8 内联预览，
+    // 而 r 票据仍保持 attachment 下载语义。
+    const gbkText = Buffer.from([0xd6, 0xd0, 0xce, 0xc4, 0xb2, 0xe2, 0xca, 0xd4]);
+    const upText = await fetch(BASE + '/v1/files/originals', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'text/plain',
+        'x-file-name': encodeURIComponent('gbk.txt'),
+        'x-file-mime': 'text/plain',
+      },
+      body: gbkText,
+    });
+    const textJson = await upText.json().catch(() => ({}));
+    check(
+      '上传 GB18030 文本原件',
+      (upText.status === 200 || upText.status === 201) && textJson.fileId,
+      `status=${upText.status}`
+    );
+
+    const textUrlRes = await fetch(
+      `${BASE}/v1/files/originals/${textJson.fileId}/url?sessionId=${sessionId}`,
+      { headers: { authorization: `Bearer ${token}` } }
+    );
+    const textUrls = await textUrlRes.json().catch(() => ({}));
+    const textQuery = (ty) =>
+      `${BASE}/v1/files/content?file_id=${textJson.fileId}` +
+      `&state=${encodeURIComponent(textUrls.urls[ty])}&ty=${ty}`;
+
+    const preview = await fetch(textQuery('p'));
+    check(
+      '文本预览为 text/plain; charset=utf-8 + inline',
+      preview.headers.get('content-type') === 'text/plain; charset=utf-8' &&
+        (preview.headers.get('content-disposition') || '').startsWith('inline'),
+      `type=${preview.headers.get('content-type')} disp=${preview.headers.get('content-disposition')}`
+    );
+    check('GB18030 已在服务端转成 UTF-8', (await preview.text()) === '中文测试');
+
+    const download = await fetch(textQuery('r'));
+    check(
+      'r 票据仍按 attachment 下载',
+      download.headers.get('content-type') === 'application/octet-stream' &&
+        (download.headers.get('content-disposition') || '').startsWith('attachment'),
+      `type=${download.headers.get('content-type')} disp=${download.headers.get('content-disposition')}`
+    );
+    await download.arrayBuffer();
   } finally {
     server.close();
     await ctx.sessionStore.close().catch(() => {});
