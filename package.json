@@ -23,6 +23,7 @@
     "start": "node src/server.js",
     "start:dist": "node dist/src/server.js",
     "dev": "node src/server.js",
+    "dev:local": "node scripts/dev-local.js",
     "mock:upstream": "node scripts/mock-upstream.js",
     "mock:echo": "node scripts/echo-upstream.js",
     "test": "node test/unit.test.js && node test/stream.test.js && node test/cors.test.js",
