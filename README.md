@@ -40,6 +40,8 @@ npm start
 | `alice` | `Alice@Passw0rd` |
 | `bob` | `Bob@Passw0rd` |
 
+> 想在本地把服务跑成 **HTTPS**（验证 Secure Cookie、SSE over TLS、浏览器证书告警等）见 [本地 HTTPS 测试](#本地-https-测试)。
+
 > `--ignore-scripts` 说明：`argon2` 的安装脚本是 `node-gyp-build`（无预编译产物时才编译）。若不希望跳过，可先 `npm install -g node-gyp` 并确保有 C++ 工具链。**上线前必须在目标机用不带 `--ignore-scripts` 的 `npm ci` 验证一次**（方案 A-B-01）。
 
 ## 本地 MySQL + Redis
@@ -387,6 +389,59 @@ npm run test:echo      # 复读机自身 12 项单测（零依赖）
 npm run smoke:echo     # 复读机 × 中转链路 端到端 19 项（自起服务，不需 MySQL/Redis/远程 Key）
 ```
 
+## 本地 HTTPS 测试
+
+生产链路是「浏览器 HTTPS → Nginx 终结 TLS → 应用回环 HTTP」。要在本地把**应用本身**跑成 HTTPS（验证 Secure Cookie、SSE over TLS、浏览器证书告警等），用仓库内置的自签证书方案：
+
+```bash
+npm run cert        # 生成自签名证书：secrets/tls_cert.pem + secrets/tls_key.pem（SAN 含 localhost / 127.0.0.1 / ::1）
+npm run dev:https   # 一键起「HTTPS 后端 + 本地复读机上游」
+```
+
+打开 <https://127.0.0.1:3000> 即可（首次访问浏览器会告警「不安全」，需在证书详情里手动信任）。
+
+也可以只启动后端：
+
+```bash
+# .env 中加入（或临时设环境变量）
+TLS_ENABLED=1
+TLS_CERT_PATH=secrets/tls_cert.pem
+TLS_KEY_PATH=secrets/tls_key.pem
+npm start
+```
+
+### 相关环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `TLS_ENABLED` | `0` | 开启后应用用 `https.createServer` 监听（本地/测试用） |
+| `TLS_CERT_PATH` | `secrets/tls_cert.pem` | 证书路径 |
+| `TLS_KEY_PATH` | `secrets/tls_key.pem` | 私钥路径 |
+| `TLS_CA_PATH` | 空 | 附加 CA（PEM），自签链 / 企业 CA 场景 |
+| `TLS_REDIRECT_HTTP_PORT` | `0` | >0 时额外监听一个纯 HTTP 端口并 301 跳到 HTTPS（复现强制跳转） |
+| `TLS_REDIRECT_HOST` | 空 | 跳转目标 Host，留空取请求的 Host 头 |
+| `SESSION_COOKIE_SECURE` | 按环境自动 | 开启 TLS 时自动为 `true`（与生产一致） |
+
+### 验收脚本走 HTTPS
+
+```bash
+npm run cert
+npm run dev:https                                     # 终端 A：起服务
+npm run smoke -- https://127.0.0.1:3000               # 终端 B：冒烟（回环地址自动放行自签证书）
+npm run verify:gate -- https://127.0.0.1:3000         # 闸门/时序验证
+```
+
+> 回环地址（`127.0.0.1` / `localhost`）在 `scripts/_client.js` 中自动放行自签证书；访问非回环地址需显式设 `TLS_INSECURE=1`。
+
+### 强制 HTTP → HTTPS 跳转（本地复现 Nginx 行为）
+
+```bash
+TLS_ENABLED=1 TLS_REDIRECT_HTTP_PORT=3001 npm start
+curl -I http://127.0.0.1:3001/health   # 301 → https://127.0.0.1:3000/health
+```
+
+> 生产环境仍由 Nginx 终结 TLS（`deploy/nginx-api.conf`），应用保持只监听回环 HTTP；`TLS_ENABLED` 只服务于本地与测试环境。
+
 ## 测试与验收
 
 ```bash
@@ -493,7 +548,7 @@ auth-demo/
 │   ├── 003_files.sql           # app_files / app_file_refs
 │   └── 004_import.sql          # import_jobs 审计
 ├── data/files/                 # 本地原件目录（已 gitignore，生产另行挂载）
-├── scripts/                    # 密钥、迁移、种子、admin、import、冒烟、验证、构建
+├── scripts/                    # 密钥、证书、迁移、种子、admin、import、冒烟、验证、构建
 ├── test/unit.test.js + helpers # 单元测试与 ZIP 夹具
 ├── deploy/                     # systemd、Nginx
 ├── docker-compose.yml

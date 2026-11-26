@@ -10,11 +10,55 @@
  *   - createFetcher：fetch 包装器，保留流式响应 / Headers API（供 SSE 脚本用），
  *     自动注入 Origin + Cookie Jar、捕获响应 Set-Cookie。
  *
+ * HTTPS 支持：
+ *   - 目标为 https 时自动走 TLS；本地自签名证书需设 TLS_INSECURE=1 放行校验
+ *     （仅影响本脚本的请求，不会改全局 NODE_TLS_REJECT_UNAUTHORIZED）。
+ *
  * 注：Node 的 fetch（undici）允许设置 origin/cookie 头（与浏览器不同），
  * 故 createFetcher 可行；浏览器侧仍由真实浏览器自动处理 Cookie 与禁改 Origin。
  */
 const http = require('node:http');
 const https = require('node:https');
+
+/** 是否放行自签名证书（本地 HTTPS 联调用） */
+const INSECURE_TLS =
+  process.env.TLS_INSECURE === '1' ||
+  process.env.TLS_INSECURE === 'true' ||
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0';
+
+/**
+ * 回环地址（localhost / 127.0.0.0/8 / ::1）默认放行自签证书：
+ * 本地 HTTPS 联调用的就是自签证书，脚本无需额外配置即可跑通。
+ * 非回环地址必须显式 TLS_INSECURE=1 才放行。
+ */
+function isLoopback(host) {
+  const h = String(host || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h === '::1' || h === '0.0.0.0') return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+/** 放行自签时用的 undici dispatcher（惰性创建，仅 https + 放行时才需要） */
+let insecureDispatcher = null;
+function getInsecureDispatcher() {
+  if (insecureDispatcher) return insecureDispatcher;
+  const undici = require('undici');
+  insecureDispatcher = new undici.Agent({ connect: { rejectUnauthorized: false } });
+  return insecureDispatcher;
+}
+
+/**
+ * 按目标地址选择 fetch 实现：
+ *   https + （回环地址 或 显式 TLS_INSECURE=1）→ undici，关闭证书校验（本地自签证书）；
+ *   其余 → 原生 fetch（正常校验证书）。
+ * 注意：原生 fetch 不接受 dispatcher，放行自签证书只能用 undici 的 fetch。
+ */
+async function fetchTarget(target, init = {}) {
+  if (target.startsWith('https://') && (INSECURE_TLS || isLoopback(new URL(target).hostname))) {
+    const undici = require('undici');
+    return undici.fetch(target, { ...init, dispatcher: getInsecureDispatcher() });
+  }
+  return fetch(target, init);
+}
 
 function createClient(base) {
   const origin = new URL(base).origin;
@@ -64,6 +108,8 @@ function createClient(base) {
           port: url.port || (url.protocol === 'https:' ? 443 : 80),
           path: url.pathname + url.search,
           headers,
+          // 本地自签名证书：回环地址默认放行，其他地址需显式 TLS_INSECURE=1
+          ...(url.protocol === 'https:' ? { rejectUnauthorized: !(INSECURE_TLS || isLoopback(url.hostname)) } : {}),
         },
         (res) => {
           mergeSetCookie(res.headers);
@@ -133,7 +179,8 @@ function createFetcher(base) {
     if (!headers.has('origin')) headers.set('origin', origin);
     const ck = cookieHeader();
     if (ck && !headers.has('cookie')) headers.set('cookie', ck);
-    const res = await fetch(base + path, { ...init, headers });
+    const target = base + path;
+    const res = await fetchTarget(target, { ...init, headers });
     capture(res);
     return res;
   };
@@ -141,4 +188,4 @@ function createFetcher(base) {
   return { fetch: doFetch, jar, origin, base, capture };
 }
 
-module.exports = { createClient, createFetcher };
+module.exports = { createClient, createFetcher, fetchTarget };

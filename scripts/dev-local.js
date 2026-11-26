@@ -5,6 +5,7 @@
  *   npm run dev:local                              # 复读机上游 :8788（能看清请求是否真的到达上游）
  *   npm run dev:local -- --mock                    # 固定 tok0 tok1… 的 mock 上游 :8787
  *   npm run dev:local -- --memory                  # 忽略 .env 的 MySQL/Redis，纯内存后端
+ *   npm run dev:local -- --https                   # 后端改用 https（自签证书，缺证书自动生成）
  *   npm run dev:local -- --port 4000 --upstream-port 8899
  *   npm run dev:local -- --host 0.0.0.0            # 局域网访问
  *
@@ -19,6 +20,8 @@
  * 加 --memory 可强制内存后端，无视 .env，适合本机没有 MySQL/Redis 的场景。
  */
 const fs = require('node:fs');
+const http = require('node:http');
+const https = require('node:https');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
@@ -34,6 +37,7 @@ try {
     options: {
       mock: { type: 'boolean', default: false },
       memory: { type: 'boolean', default: false },
+      https: { type: 'boolean', default: false },
       port: { type: 'string' },
       'upstream-port': { type: 'string' },
       host: { type: 'string' },
@@ -42,7 +46,7 @@ try {
   }));
 } catch (error) {
   console.error(error.message);
-  console.error('用法：npm run dev:local -- [--mock] [--memory] [--port 3000] [--upstream-port 8788] [--host 127.0.0.1]');
+  console.error('用法：npm run dev:local -- [--mock] [--memory] [--https] [--port 3000] [--upstream-port 8788] [--host 127.0.0.1]');
   process.exit(2);
 }
 
@@ -52,6 +56,7 @@ if (values.help) {
 选项：
   --mock                 使用 mock-upstream（固定 tok0 tok1…）而非复读机
   --memory               强制内存后端（忽略 .env 的 MySQL/Redis，零依赖）
+  --https                后端启用 HTTPS（自动生成自签名证书到 secrets/）
   --port <n>             后端端口，默认 3000
   --upstream-port <n>    测试上游端口，默认 mock=8787 / echo=8788
   --host <h>             后端监听地址，默认 127.0.0.1
@@ -72,10 +77,14 @@ function portOf(raw, def, name) {
 const APP_PORT = portOf(values.port, 3000, '--port');
 const UPSTREAM_PORT = portOf(values['upstream-port'], values.mock ? 8787 : 8788, '--upstream-port');
 const HOST = values.host || '127.0.0.1';
-const APP_URL = `http://127.0.0.1:${APP_PORT}`;
+const USE_TLS = Boolean(values.https);
+const APP_PROTOCOL = USE_TLS ? 'https' : 'http';
+const APP_URL = `${APP_PROTOCOL}://127.0.0.1:${APP_PORT}`;
 const UPSTREAM_URL = `http://127.0.0.1:${UPSTREAM_PORT}`;
 const UPSTREAM_SCRIPT = values.mock ? 'mock-upstream.js' : 'echo-upstream.js';
 const UPSTREAM_NAME = values.mock ? 'mock 上游' : '本地复读机';
+const TLS_CERT = path.join(ROOT, 'secrets', 'tls_cert.pem');
+const TLS_KEY = path.join(ROOT, 'secrets', 'tls_key.pem');
 
 /** .env 里是否显式配置了某项（load-env 不覆盖已存在的环境变量，故需先看一眼） */
 function envFileHas(key, file = process.env.ENV_FILE || path.join(ROOT, '.env')) {
@@ -103,6 +112,20 @@ function ensureKeys() {
   });
   if (result.status !== 0 || !fs.existsSync(priv)) {
     console.error('[dev] 生成 RSA 密钥失败，请先执行 npm run keys');
+    process.exit(1);
+  }
+}
+
+/** --https：缺自签名证书时自动生成（secrets/tls_cert.pem + secrets/tls_key.pem） */
+function ensureCert() {
+  if (fs.existsSync(TLS_CERT) && fs.existsSync(TLS_KEY)) return;
+  console.log('[dev] 未找到 TLS 自签名证书，先生成一对…');
+  const result = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'gen-cert.js')], {
+    cwd: ROOT,
+    stdio: 'inherit',
+  });
+  if (result.status !== 0 || !fs.existsSync(TLS_CERT) || !fs.existsSync(TLS_KEY)) {
+    console.error('[dev] 生成 TLS 证书失败，请先执行 npm run cert');
     process.exit(1);
   }
 }
@@ -147,13 +170,64 @@ function spawnPrefixed(scriptPath, args, env, tag) {
   return handle;
 }
 
-async function isUp(url) {
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(1500) });
-    return res.status < 500;
-  } catch {
-    return false;
-  }
+/**
+ * 探测 URL 是否可达（<500 视为已响应）。
+ * https + 本地自签证书时忽略证书校验（Node 的 https.request 单独控制，不影响全局）。
+ */
+function isUp(url) {
+  return new Promise((resolve) => {
+    const u = new URL(url);
+    const lib = u.protocol === 'https:' ? https : http;
+    const req = lib.request(
+      {
+        method: 'GET',
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + u.search,
+        rejectUnauthorized: false,
+        timeout: 1500,
+      },
+      (res) => {
+        res.resume();
+        resolve(res.statusCode < 500);
+      }
+    );
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.end();
+  });
+}
+
+/** 读 JSON（https 自签证书同样放行） */
+function getJson(url) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const lib = u.protocol === 'https:' ? https : http;
+    const req = lib.request(
+      {
+        method: 'GET',
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + u.search,
+        rejectUnauthorized: false,
+        timeout: 5000,
+      },
+      (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { body += c; });
+        res.on('end', () => {
+          try { resolve(JSON.parse(body)); } catch (e) { reject(e); }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('请求超时')); });
+    req.end();
+  });
 }
 
 async function waitFor(url, timeoutMs, proc) {
@@ -204,6 +278,7 @@ function fail(message, proc) {
 
 async function main() {
   ensureKeys();
+  if (USE_TLS) ensureCert();
 
   // 端口占用先查，避免两个进程抢同一个口后互相误导
   if (await isUp(`${UPSTREAM_URL}/health`)) {
@@ -237,6 +312,15 @@ async function main() {
     UPSTREAM_BASE_URL: UPSTREAM_URL,
     UPSTREAM_API_KEY: LOCAL_API_KEY,
   };
+  if (USE_TLS) {
+    /** 本地 HTTPS：应用内终结 TLS，证书为本地自签名（浏览器需手动信任） */
+    serverEnv.TLS_ENABLED = '1';
+    serverEnv.TLS_CERT_PATH = TLS_CERT;
+    serverEnv.TLS_KEY_PATH = TLS_KEY;
+    // 会话 Cookie 打上 Secure，与生产（TLS 终结后）行为一致
+    serverEnv.SESSION_COOKIE_SECURE = '1';
+    console.log('[dev] --https：后端启用 HTTPS（自签名证书，浏览器需信任）');
+  }
   if (values.memory) {
     // 指向空文件：让 load-env 完全跳过 .env，避免其中的 MYSQL_URL/REDIS_URL 生效
     // 先清掉上一次被强杀残留的空配置文件
@@ -266,7 +350,7 @@ async function main() {
 
   // ---- 3. 概要 ----
   let health = null;
-  try { health = await (await fetch(`${APP_URL}/health`)).json(); } catch { /* ignore */ }
+  try { health = await getJson(`${APP_URL}/health`); } catch { /* ignore */ }
 
   console.log('');
   console.log('============================================================');
@@ -278,6 +362,11 @@ async function main() {
   console.log(`  测试上游   ${UPSTREAM_URL}  （${UPSTREAM_NAME}）`);
   console.log(`             观测入参  ${UPSTREAM_URL}/__calls`);
   if (!values.mock) console.log(`             测试台    ${UPSTREAM_URL}/`);
+  if (USE_TLS) {
+    console.log('  TLS 证书   ' + TLS_CERT);
+    console.log('             浏览器首次访问会告警「不安全」，需在证书详情里手动信任；');
+    console.log('             curl 需加 -k（Node 脚本设 TLS_INSECURE=1 放行自签证书）');
+  }
   if (health) {
     const b = health.backends || {};
     console.log(`  存储后端   用户=${b.user} 会话=${b.session} 聊天=${b.chat} 附件=${b.files}`);

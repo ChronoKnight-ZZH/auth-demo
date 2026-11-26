@@ -5,13 +5,14 @@
  */
 const crypto = require('node:crypto');
 require('../src/lib/fetch-global');
+const { fetchTarget } = require('./_client');
 
 const BASE = process.argv[2] || 'http://127.0.0.1:3000';
 // 会话改走 Cookie 后，POST /auth/login 必须带 Origin 通过 CSRF 校验
 const ORIGIN = new URL(BASE).origin;
 
 async function getMeta() {
-  const r = await fetch(BASE + '/auth/public-key');
+  const r = await fetchTarget(BASE + '/auth/public-key');
   return r.json();
 }
 
@@ -31,7 +32,7 @@ function encrypt(meta, plaintext) {
 
 async function loginRaw(meta, username, password) {
   const t0 = process.hrtime.bigint();
-  const r = await fetch(BASE + '/auth/login', {
+  const r = await fetchTarget(BASE + '/auth/login', {
     method: 'POST',
     headers: { 'content-type': 'application/json', origin: ORIGIN },
     body: JSON.stringify({ encrypted: encrypt(meta, encodeLogin(username, password)) }),
@@ -64,7 +65,7 @@ async function main() {
   // ---- 2. 非法密文也折叠为同一响应（A-E-01）----
   console.log('\n2) 非法密文折叠');
   const badCt = crypto.randomBytes(256).toString('base64');
-  const badRes = await fetch(BASE + '/auth/login', {
+  const badRes = await fetchTarget(BASE + '/auth/login', {
     method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN },
     body: JSON.stringify({ encrypted: badCt }),
   });

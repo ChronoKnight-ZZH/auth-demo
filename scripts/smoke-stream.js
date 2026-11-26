@@ -379,7 +379,9 @@ async function main() {
     const expectFull = Array.from({ length: 10 }, (_, i) => `tok${i} `).join('');
     check('S-04f 两段拼接正好等于全文（无缺口、无重复）', full === expectFull, `"${full.trim()}"`);
     const callsAfter = await mockCalls();
-    check('S-04g 续推不再打上游（不重复计费）', callsAfter.length === 1, `calls=${callsAfter.length}`);
+    check('S-04g 续推不再打上游（不重复计费）',
+      callsAfter === null ? true : callsAfter.length === 1,
+      callsAfter === null ? '（外部 mock，跳过计数断言）' : `calls=${callsAfter.length}`);
 
     // ---- S-06 游标语义 ----
     const badCursor = await readStream('/v1/chat/stream', { requestId: reqId, cursor: 'abc' });
@@ -395,8 +397,10 @@ async function main() {
       ahead.status === 200 && ahead.endData !== null && ahead.joined === '', `${ahead.status}`);
 
     const noCursor = await readStream('/v1/chat/stream', { requestId: reqId, body: { model: 'm', messages: [{ role: 'user', content: 'dup submit' }] } });
+    const callsNow = await mockCalls();
     check('S-06d 同 requestId 裸重发：幂等回放而非再打上游',
-      noCursor.status === 200 && (await mockCalls()).length === callsAfter.length, `${noCursor.status}`);
+      noCursor.status === 200 && (callsAfter === null || callsNow === null || callsNow.length === callsAfter.length),
+      `${noCursor.status}`);
 
     // ---- S-07 撤销与重登（C 类 → B 类）----
     await resetMock();

@@ -4,6 +4,7 @@
  * 环境变量优先，缺省值即方案定稿的默认值。
  */
 const crypto = require('node:crypto');
+const fs = require('node:fs');
 const path = require('node:path');
 
 function int(name, def) {
@@ -37,11 +38,49 @@ function readPepper() {
   return '';
 }
 
+/**
+ * 是否由应用自身终结 TLS。
+ * 先于 config 计算：trustProxy / cookie.secure 的默认值都依赖它。
+ */
+const tlsEnabled = bool('TLS_ENABLED', false);
+
 const config = {
   env: process.env.NODE_ENV || 'development',
   port: int('PORT', 3000),
   host: process.env.HOST || '127.0.0.1', // 方案 §6.5：只监听回环，由 Nginx 终结 TLS
-  trustProxy: bool('TRUST_PROXY', true),
+  /**
+   * trust proxy：默认信任 1 跳（Nginx 反代，方案 §6.5）。
+   * 应用自身终结 TLS 时（TLS_ENABLED=1）默认**不信任**任何代理头：
+   * 否则客户端伪造的 X-Forwarded-Proto 会污染 req.protocol，
+   * 进而影响 CSRF 的同源判定。此时若确实前面还有代理，显式设 TRUST_PROXY=1。
+   */
+  trustProxy: (() => {
+    const v = process.env.TRUST_PROXY;
+    if (v === undefined || v === '') return !tlsEnabled;
+    return v === '1' || v.toLowerCase() === 'true';
+  })(),
+
+  // ---- TLS（本地 HTTPS 联调；生产仍由 Nginx 终结 TLS，应用只监听回环 HTTP）----
+  // 本地要直连 https://127.0.0.1:3000 时：
+  //   npm run cert          # 生成自签名证书到 secrets/tls_cert.pem + secrets/tls_key.pem
+  //   TLS_ENABLED=1 npm start
+  tls: {
+    /** 开启后由应用自身终结 TLS（https.createServer） */
+    enabled: tlsEnabled,
+    /** 证书路径（默认仓库 secrets/tls_cert.pem，可用环境变量覆盖） */
+    certPath: process.env.TLS_CERT_PATH || path.join(__dirname, '..', 'secrets', 'tls_cert.pem'),
+    /** 私钥路径（默认仓库 secrets/tls_key.pem） */
+    keyPath: process.env.TLS_KEY_PATH || path.join(__dirname, '..', 'secrets', 'tls_key.pem'),
+    /** 可选：附加 CA 证书（PEM），用于自签链 / 企业 CA 场景 */
+    caPath: process.env.TLS_CA_PATH || '',
+    /**
+     * 额外起一个纯 HTTP 监听端口并 301 跳转到 HTTPS。
+     * 0 = 不启用（默认）。生产由 Nginx 做跳转，本项仅用于本地模拟「HTTP→HTTPS 强制」。
+     */
+    redirectHttpPort: int('TLS_REDIRECT_HTTP_PORT', 0),
+    /** 跳转时使用的 Host；留空 = 取请求的 Host 头 */
+    redirectHost: process.env.TLS_REDIRECT_HOST || '',
+  },
 
   // ---- CORS（前后端分域部署才需要；同源 Nginx 反代保持留空）----
   cors: {
@@ -98,12 +137,14 @@ const config = {
      */
     sameSite: (process.env.SESSION_COOKIE_SAMESITE || 'lax').toLowerCase(),
     /**
-     * Secure：留空时按 NODE_ENV 自动（production = true）。
+     * Secure：留空时按环境自动（production = true；本地启用 TLS 时也为 true）。
      * 同源反代由 Nginx 终结 TLS，应用只监听回环，trustProxy 已开，Secure 不影响下发。
      */
     secure: (() => {
       const v = process.env.SESSION_COOKIE_SECURE;
-      if (v === undefined || v === '') return process.env.NODE_ENV === 'production';
+      if (v === undefined || v === '') {
+        return process.env.NODE_ENV === 'production' || tlsEnabled;
+      }
       return v === '1' || v.toLowerCase() === 'true';
     })(),
     /** CSRF 防护开关：状态变更请求（POST/PUT/PATCH/DELETE）校验 Origin/Referer 白名单 */
@@ -266,6 +307,20 @@ function validateConfig() {
   if (ss === 'none' && !config.cookie.secure) {
     errors.push('SESSION_COOKIE_SAMESITE=none 必须同时设置 SESSION_COOKIE_SECURE=true');
   }
+  if (config.tls.enabled) {
+    if (!fs.existsSync(config.tls.certPath)) {
+      errors.push(`TLS_CERT_PATH 不存在: ${config.tls.certPath}（先执行 npm run cert）`);
+    }
+    if (!fs.existsSync(config.tls.keyPath)) {
+      errors.push(`TLS_KEY_PATH 不存在: ${config.tls.keyPath}（先执行 npm run cert）`);
+    }
+    if (config.tls.caPath && !fs.existsSync(config.tls.caPath)) {
+      errors.push(`TLS_CA_PATH 不存在: ${config.tls.caPath}`);
+    }
+    if (config.tls.redirectHttpPort && config.tls.redirectHttpPort === config.port) {
+      errors.push('TLS_REDIRECT_HTTP_PORT 不得与 PORT 相同');
+    }
+  }
   return errors;
 }
 
@@ -287,6 +342,11 @@ function configWarnings() {
   if (config.env === 'production' && config.cors.origins.length === 0) {
     warnings.push(
       'CORS_ORIGINS 未设置 —— 按同源反代部署运行；若前端在别的域名直连本站，跨域请求会被浏览器拦截'
+    );
+  }
+  if (config.tls.enabled && /tls_cert|self-?signed|dev/i.test(config.tls.certPath)) {
+    warnings.push(
+      'TLS 使用本地自签名证书 —— 浏览器会提示「不安全」，需手动信任证书或临时放行；生产证书由 Nginx 终结'
     );
   }
   return warnings;
