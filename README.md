@@ -281,6 +281,33 @@ DEDUPE_SCOPE=global              # global | user
 > 缩略图生成、病毒扫描、物理块 GC 均未实现：软删除只影响元数据，已上传的 blob
 > 需后续离线清理任务回收。文件预览支持图片与文本（服务端转 UTF-8），其他文档只提供下载。
 
+## Agent Harness（阶段 1）
+
+Agent 是独立 sidecar 模块，默认关闭；阶段 1 只做任务持久化、状态机、参数/文件归属校验和队列骨架，
+**不调用模型、不执行脚本、不创建 Docker 容器**。Chat / 登录 / 附件原有链路不变。
+
+```env
+AGENT_ENABLED=1                  # 总开关，默认 0
+AGENT_ALLOWLIST=1,2              # 可选；留空 = 所有已登录用户
+AGENT_EXECUTION_ENABLED=0        # 阶段 1 必须为 0
+AGENT_QUEUE_MODE=off             # off = 只落库排队
+```
+
+- 接口：`POST/GET /api/agent/tasks`、`POST /api/agent/tasks/:id/cancel`、
+  `GET /api/agent/tasks/:id/steps`、`GET /api/agent/tasks/:id/files`。
+- 任务、步骤、文件分别存 `agent_tasks` / `agent_task_steps` / `agent_task_files`；
+  MySQL 是状态唯一事实来源，所有用户侧查询都带 `user_id`，跨用户统一 404。
+- 状态机：`queued → running → waiting_model → completed/failed/cancelled/timed_out`；
+  终态不可回退，取消不会被 Worker 覆盖。
+- 附件只接受当前用户已上传的 `file_ids`，创建时保存授权快照；输出归档、模型循环、
+  Docker 执行器与定时清理在后续阶段接入。
+
+完整说明（含幂等、限制值、Worker 启动条件）见 [docs/agent.md](docs/agent.md)：
+
+- [阶段 1 上线执行单](docs/agent-phase1-go-live.md)
+- [第 3 步：生产部署操作手册](docs/agent-step3-deploy.md)
+- [第 4 步：上线验收与灰度操作手册](docs/agent-step4-acceptance.md)
+
 ## 账号管理（CLI）
 
 不开放注册，账号只能由管理员在服务器上创建。需要 `MYSQL_URL`；锁定和重置密码
@@ -528,6 +555,8 @@ auth-demo/
 │   │   ├── zip-reader.js       # 只读 ZIP32（STORE/DEFLATE、CRC）
 │   │   ├── history.js          # 归档校验与本地 Session 转换
 │   │   └── import-history.js   # 导入事务、图片归档、幂等/回滚
+│   ├── modules/agent/           # Agent 任务：API、状态机、仓储、队列、执行器骨架
+│   ├── workers/agent.worker.js  # Agent 独立 Worker 入口（阶段 1 默认拒绝启动）
 │   ├── account/admin-service.js # 账号创建/锁定/解锁/重置密码
 │   ├── session/
 │   │   ├── token.js            # Token 生成与哈希
@@ -546,10 +575,13 @@ auth-demo/
 │   ├── 001_init.sql            # users
 │   ├── 002_chat.sql            # chat_sessions
 │   ├── 003_files.sql           # app_files / app_file_refs
-│   └── 004_import.sql          # import_jobs 审计
+│   ├── 004_import.sql          # import_jobs 审计
+│   └── 005_agent.sql           # agent_tasks / agent_task_steps / agent_task_files
 ├── data/files/                 # 本地原件目录（已 gitignore，生产另行挂载）
+├── data/agent/                 # Agent 任务工作目录（阶段 2+ 使用）
 ├── scripts/                    # 密钥、证书、迁移、种子、admin、import、冒烟、验证、构建
 ├── test/unit.test.js + helpers # 单元测试与 ZIP 夹具
+├── docs/agent*.md              # Agent 设计、部署与验收操作手册
 ├── deploy/                     # systemd、Nginx
 ├── docker-compose.yml
 └── public/index.html

@@ -53,6 +53,7 @@ const c = run(mw, { origin: 'https://CHAT.shunkai-DG.cn' }, 'OPTIONS');
 console.log('C preflight:', JSON.stringify(c));
 if (c.passed || c.status !== 204 || !c.ended ||
     !c.headers['Access-Control-Allow-Headers'].includes('X-File-Name') ||
+    !c.headers['Access-Control-Allow-Headers'].includes('Idempotency-Key') ||
     !c.headers['Access-Control-Allow-Methods'].includes('PUT') ||
     !c.headers['Access-Control-Allow-Methods'].includes('PATCH') ||
     c.headers['Vary'] !== 'Origin') throw new Error('C failed');

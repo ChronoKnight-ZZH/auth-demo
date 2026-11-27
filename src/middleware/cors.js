@@ -15,7 +15,7 @@
 
 const ALLOW_METHODS = 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD';
 /** 前端实际会发送的自定义请求头；预检 Allow-Headers 给全量，避免逐头协商 */
-const ALLOW_HEADERS = 'Authorization, Content-Type, Accept, X-Request-Id, X-File-Name, X-File-Mime';
+const ALLOW_HEADERS = 'Authorization, Content-Type, Accept, X-Request-Id, X-File-Name, X-File-Mime, Idempotency-Key';
 /** 跨域时前端 JS 需要读取的非安全响应头 */
 const EXPOSE_HEADERS = 'Retry-After, Content-Type';
 

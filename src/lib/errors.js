@@ -53,6 +53,28 @@ const CODES = {
   FILE_ACCESS_DENIED: [404, '文件不存在'],
   /** 文件服务关闭 */
   FILES_DISABLED: [503, '文件服务未启用'],
+
+  // ---- Agent Harness（第一阶段：任务基础设施）----
+  /** 总开关关闭 */
+  AGENT_DISABLED: [503, 'Agent 服务未启用'],
+  /** 用户不在灰度白名单 */
+  AGENT_NOT_ALLOWED: [403, '当前账号未开通 Agent 功能'],
+  /** 任务不存在或不属于当前用户（统一 404，避免探测） */
+  AGENT_TASK_NOT_FOUND: [404, '任务不存在'],
+  /** 当前状态不允许该操作（如取消终态任务） */
+  AGENT_INVALID_STATE: [409, '任务当前状态不允许该操作'],
+  /** 全局并发已满（阶段 2+ 使用） */
+  AGENT_BUSY: [429, 'Agent 任务繁忙，请稍后重试'],
+  /** Agent 任务存储不可用 */
+  AGENT_STORE_UNAVAILABLE: [503, 'Agent 任务存储不可用'],
+  /** 执行器尚未接入或未开启 */
+  AGENT_EXECUTOR_UNAVAILABLE: [503, 'Agent 执行器尚未就绪'],
+  /** 模型返回了未注册的工具 */
+  AGENT_TOOL_NOT_FOUND: [400, '工具不存在'],
+  /** 工具参数不符合 schema */
+  AGENT_TOOL_INVALID_INPUT: [400, '工具参数无效'],
+  /** 工具执行超时 */
+  AGENT_TOOL_TIMEOUT: [504, '工具执行超时'],
 };
 
 class AppError extends Error {

@@ -278,6 +278,55 @@ const config = {
     })(),
   },
 
+  // ---- Agent Harness（第一阶段：任务基础设施；执行器默认关闭）----
+  agent: {
+    /** 总开关：生产默认关闭，灰度时显式开启 */
+    enabled: bool('AGENT_ENABLED', false),
+    /** 逗号分隔的用户 ID 白名单；为空 = 不额外限制（仍受 enabled 约束） */
+    allowlist: (process.env.AGENT_ALLOWLIST || '')
+      .split(',').map((s) => s.trim()).filter(Boolean),
+    /** 执行器是否就绪；阶段 2/3 接入模型和 Docker 前置条件 */
+    executionEnabled: bool('AGENT_EXECUTION_ENABLED', false),
+    /** 模型名称；地址、Key 与 messagesPath 复用 upstream 配置 */
+    model: process.env.AGENT_MODEL || 'deepseek-chat',
+    maxTokens: int('AGENT_MAX_TOKENS', 4096),
+    /** 任务总时限与单次脚本时限 */
+    taskTimeoutMs: int('AGENT_TASK_TIMEOUT_MS', 600_000),
+    scriptTimeoutMs: int('AGENT_SCRIPT_TIMEOUT_MS', 120_000),
+    /** 调用预算 */
+    maxModelCalls: int('AGENT_MAX_MODEL_CALLS', 12),
+    maxToolCalls: int('AGENT_MAX_TOOL_CALLS', 20),
+    /** 文件限制 */
+    maxInputFiles: int('AGENT_MAX_INPUT_FILES', 20),
+    maxInputBytes: int('AGENT_MAX_INPUT_BYTES', 128 * 1024 * 1024),
+    maxOutputBytes: int('AGENT_MAX_OUTPUT_BYTES', 64 * 1024 * 1024),
+    maxOutputFiles: int('AGENT_MAX_OUTPUT_FILES', 10),
+    userQuotaBytes: int('AGENT_USER_QUOTA_BYTES', 20 * 1024 * 1024 * 1024),
+    /** 保留期（清理任务在后续阶段接入） */
+    retentionDays: int('AGENT_RETENTION_DAYS', 30),
+    logRetentionDays: int('AGENT_LOG_RETENTION_DAYS', 7),
+    outputRetentionDays: int('AGENT_OUTPUT_RETENTION_DAYS', 30),
+    /** 任务工作目录根；生产请挂独立数据盘 */
+    workspaceDir: process.env.AGENT_WORKSPACE_DIR || path.join(__dirname, '..', 'data', 'agent'),
+    /** Docker 执行限制（阶段 3 使用；先集中配置，避免散落硬编码） */
+    pythonImage: process.env.AGENT_PYTHON_IMAGE || 'agent-python:1',
+    containerMemoryBytes: int('AGENT_CONTAINER_MEMORY_BYTES', 768 * 1024 * 1024),
+    containerCpus: (() => {
+      const value = Number(process.env.AGENT_CONTAINER_CPUS || 1);
+      return Number.isFinite(value) && value > 0 ? value : 1;
+    })(),
+    containerPidsLimit: int('AGENT_CONTAINER_PIDS_LIMIT', 128),
+    /** 队列：off（只落库，不消费）/ inline（进程内执行，仅开发）/ bullmq */
+    queueMode: (process.env.AGENT_QUEUE_MODE || 'off').toLowerCase(),
+    queueName: process.env.AGENT_QUEUE_NAME || 'agent-tasks',
+    queuePrefix: process.env.AGENT_QUEUE_PREFIX || 'agent',
+    /** Redis 异常时不能拖住 API：投递超时后任务保持 queued，由巡检/补偿接管 */
+    queueEnqueueTimeoutMs: int('AGENT_QUEUE_ENQUEUE_TIMEOUT_MS', 3_000),
+    workerConcurrency: int('AGENT_WORKER_CONCURRENCY', 1),
+    /** Agent 独立连接池；2C4G 机器不宜与现有池叠加过大 */
+    mysqlPoolSize: int('AGENT_MYSQL_POOL_SIZE', 4),
+  },
+
   // ---- 其他 ----
   bodyLimit: process.env.BODY_LIMIT || '16kb',
   /** /v1 聊天请求体上限：附件按 file_id 引用，正文本身不需要很大 */
@@ -306,6 +355,36 @@ function validateConfig() {
   }
   if (ss === 'none' && !config.cookie.secure) {
     errors.push('SESSION_COOKIE_SAMESITE=none 必须同时设置 SESSION_COOKIE_SECURE=true');
+  }
+  if (!['off', 'inline', 'bullmq'].includes(config.agent.queueMode)) {
+    errors.push('AGENT_QUEUE_MODE 必须是 off / inline / bullmq 之一');
+  }
+  if (config.agent.taskTimeoutMs < 1000) {
+    errors.push('AGENT_TASK_TIMEOUT_MS 不得小于 1000ms');
+  }
+  if (config.agent.scriptTimeoutMs <= 0 || config.agent.scriptTimeoutMs >= config.agent.taskTimeoutMs) {
+    errors.push('AGENT_SCRIPT_TIMEOUT_MS 必须大于 0 且小于 AGENT_TASK_TIMEOUT_MS');
+  }
+  if (config.agent.maxModelCalls < 1 || config.agent.maxToolCalls < 1) {
+    errors.push('AGENT_MAX_MODEL_CALLS / AGENT_MAX_TOOL_CALLS 必须大于 0');
+  }
+  if (config.agent.maxInputFiles < 0 || config.agent.maxOutputFiles < 0) {
+    errors.push('AGENT_MAX_INPUT_FILES / AGENT_MAX_OUTPUT_FILES 不得为负数');
+  }
+  // 2C4G 基线：全局只允许一个任务执行，避免容器与 API 争抢内存/CPU
+  if (config.agent.workerConcurrency !== 1) {
+    errors.push('AGENT_WORKER_CONCURRENCY 阶段 1 必须为 1');
+  }
+  if (config.agent.queueEnqueueTimeoutMs < 100) {
+    errors.push('AGENT_QUEUE_ENQUEUE_TIMEOUT_MS 不得小于 100ms');
+  }
+  if (config.agent.retentionDays < 1
+    || config.agent.logRetentionDays < 1
+    || config.agent.outputRetentionDays < 1) {
+    errors.push('AGENT_RETENTION_DAYS / AGENT_LOG_RETENTION_DAYS / AGENT_OUTPUT_RETENTION_DAYS 必须大于 0');
+  }
+  if (config.agent.enabled && config.agent.queueMode === 'bullmq' && !config.redis.url) {
+    errors.push('AGENT_QUEUE_MODE=bullmq 需要 REDIS_URL');
   }
   if (config.tls.enabled) {
     if (!fs.existsSync(config.tls.certPath)) {
@@ -343,6 +422,15 @@ function configWarnings() {
     warnings.push(
       'CORS_ORIGINS 未设置 —— 按同源反代部署运行；若前端在别的域名直连本站，跨域请求会被浏览器拦截'
     );
+  }
+  if (config.agent.enabled && config.agent.allowlist.length === 0) {
+    warnings.push('AGENT_ALLOWLIST 为空 —— 所有已登录用户都可创建 Agent 任务');
+  }
+  if (config.agent.enabled && !config.agent.executionEnabled) {
+    warnings.push('AGENT_EXECUTION_ENABLED=0 —— Agent 任务只会落库排队，不会被执行');
+  }
+  if (config.agent.enabled && config.agent.queueMode === 'off') {
+    warnings.push('AGENT_QUEUE_MODE=off —— 任务不会投递到队列，需由后续 Worker 阶段接管');
   }
   if (config.tls.enabled && /tls_cert|self-?signed|dev/i.test(config.tls.certPath)) {
     warnings.push(
