@@ -212,8 +212,8 @@ async function main() {
         HOST: '127.0.0.1',
         UPSTREAM_BASE_URL: `http://127.0.0.1:${ECHO_PORT}`,
         UPSTREAM_API_KEY: SERVER_KEY,
-        // 内存后端：本冒烟不依赖 MySQL / Redis
-        MYSQL_URL: '', REDIS_URL: '',
+        // 内存后端：本冒烟不依赖 MySQL / Redis（Agent 队列同步降到 off，否则会因缺 REDIS_URL 起不来）
+        MYSQL_URL: '', REDIS_URL: '', AGENT_QUEUE_MODE: 'off',
         SSE_HEARTBEAT_MS: '600',
         UPSTREAM_HEADERS_TIMEOUT_MS: '6000',
         UPSTREAM_IDLE_TIMEOUT_MS: '2500',

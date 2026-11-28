@@ -58,6 +58,34 @@ function deltas(text) {
   return out;
 }
 
+/** 解析出全部 SSE 事件对象（Anthropic 与 OpenAI 两种形状都覆盖） */
+function events(text) {
+  const out = [];
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('data: ')) continue;
+    const raw = line.slice(6);
+    if (raw === '[DONE]') continue;
+    try { out.push(JSON.parse(raw)); } catch { /* 非 JSON */ }
+  }
+  return out;
+}
+
+/** content_block_start 出现的内容块类型序列（Anthropic） */
+function blockTypes(text) {
+  return events(text)
+    .filter((o) => o.type === 'content_block_start')
+    .map((o) => o.content_block.type + (o.content_block.name ? '/' + o.content_block.name : ''));
+}
+
+/** 某类增量事件的文本拼接（thinking_delta / signature_delta 等） */
+function deltaText(text, type) {
+  return events(text)
+    .filter((o) => o.type === 'content_block_delta' && o.delta && o.delta.type === type)
+    .map((o) => o.delta[type === 'text_delta' ? 'text' : type === 'thinking_delta' ? 'thinking' : 'signature'] || '')
+    .join('');
+}
+
+
 const child = spawn(process.execPath, [path.join(__dirname, '..', 'scripts', 'echo-upstream.js'), String(PORT)], {
   stdio: ['ignore', 'ignore', 'pipe'],
 });
@@ -250,3 +278,242 @@ test('E-12 /__calls 记录鉴权前缀，且不含 Key 明文全文', async () =
   assert.strictEqual(c.hasAuth, true);
   assert.ok(String(c.authPrefix).startsWith('Bearer'), `authPrefix=${JSON.stringify(c.authPrefix)}`);
 });
+
+// ------------------------------------------------------ 回复表 / 随机回复
+
+test('E-13 回复表：/mode random 从表里选一条，/reply 可指定条目', async () => {
+  const list = JSON.parse((await get('/__replies')).text);
+  assert.ok(list.count >= 8, `回复表应有若干条，实得 ${list.count}`);
+
+  const res = await post('/anthropic/v1/messages', {
+    model: 'm', stream: true,
+    messages: [{ role: 'user', content: '/mode random\n随便来一条' }],
+  });
+  const joined = deltas(res.text).join('');
+  assert.match(joined, /回复表 r\d+/, '应标明来自哪一条：' + joined.slice(0, 60));
+  const hit = list.replies.find((r) => joined.includes(`回复表 ${r.id}`));
+  assert.ok(hit, '选中的 id 必须在表内');
+  const full = list.replies.find((r) => r.id === 'r04');
+  assert.ok(full, '默认表应含 r04');
+
+  const one = await post('/anthropic/v1/messages', {
+    model: 'm', stream: true,
+    messages: [{ role: 'user', content: '/mode random\n/reply r04\n随便来一条' }],
+  });
+  assert.ok(deltas(one.text).join('').includes('方案'), 'r04 应命中表格内容：' + deltas(one.text).join('').slice(0, 60));
+});
+
+test('E-14 /seed 固定随机序列；POST /__replies 可换表', async () => {
+  const call = () => post('/anthropic/v1/messages', {
+    model: 'm', stream: true,
+    messages: [{ role: 'user', content: '/mode random\n/seed 7\n随机但可复现' }],
+  });
+  const a = deltas((await call()).text).join('');
+  const b = deltas((await call()).text).join('');
+  assert.strictEqual((/回复表 (r\d+)/.exec(a) || [])[1], (/回复表 (r\d+)/.exec(b) || [])[1], '同 seed 应选同一条');
+
+  await post('/__replies', { replies: [{ id: 'z1', topic: '演示', text: '自定义回复表的内容甲' }, { id: 'z2', topic: '演示', text: '自定义回复表的内容乙' }] });
+  const c = deltas((await post('/anthropic/v1/messages', {
+    model: 'm', stream: true, messages: [{ role: 'user', content: '/mode random\n/reply z2' }],
+  })).text).join('');
+  assert.ok(c.includes('内容乙'), '换表后应按新表命中：' + c.slice(0, 80));
+  const reset = JSON.parse((await post('/__replies', { reset: true })).text);
+  assert.ok(reset.count >= 8, 'reset 应还原默认表');
+});
+
+// ------------------------------------------------------------ 思考与联网
+
+test('E-15 /think：思考块完整（thinking_delta + signature_delta），正文不受影响', async () => {
+  const res = await post('/anthropic/v1/messages', {
+    model: 'm', stream: true,
+    messages: [{ role: 'user', content: '/think\n思考一下这个问题' }],
+  });
+  assert.ok(blockTypes(res.text).includes('thinking'), JSON.stringify(blockTypes(res.text)));
+  const thinking = deltaText(res.text, 'thinking_delta');
+  assert.ok(thinking.length > 10, '思考内容过短：' + thinking);
+  assert.ok(deltaText(res.text, 'signature_delta'), '思考块应有 signature_delta');
+  assert.ok(deltas(res.text).join('').includes('思考一下这个问题'), '正文仍应复读');
+  assert.match(res.text, /event: message_stop/);
+});
+
+test('E-16 /search：联网搜索两块（调用 + 结果）+ 正文引用，usage 带 server_tool_use', async () => {
+  const res = await post('/anthropic/v1/messages', {
+    model: 'm', stream: true,
+    messages: [{ role: 'user', content: '/search 3\n帮我查一下最新情况' }],
+  });
+  const types = blockTypes(res.text);
+  assert.ok(types.includes('server_tool_use/deepseek_web_search'), JSON.stringify(types));
+  assert.ok(types.includes('web_search_tool_result'), JSON.stringify(types));
+  const results = events(res.text)
+    .find((o) => o.type === 'content_block_start' && o.content_block.type === 'web_search_tool_result').content_block.content;
+  assert.strictEqual(results.length, 3, '应返回 3 条结果');
+  for (const r of results) {
+    assert.match(r.url, /^https?:\/\//);
+    assert.strictEqual(typeof r.title, 'string');
+    assert.strictEqual(typeof r.snippet, 'string');
+  }
+  const cites = events(res.text).filter((o) => o.delta && o.delta.type === 'citations_delta');
+  assert.strictEqual(cites.length, 3, '每条结果应各有一次 citations_delta');
+  const md = events(res.text).find((o) => o.type === 'message_delta');
+  assert.ok(md.usage.input_tokens >= 0 && typeof md.usage.cache_read_input_tokens === 'number', 'usage 四字段齐全');
+  assert.ok(md.usage.server_tool_use && md.usage.server_tool_use.web_search_requests === 1, JSON.stringify(md.usage));
+});
+
+test('E-17 跟随请求开关：thinking.enabled / tools 声明即出对应块（无需命令行）', async () => {
+  const res = await post('/anthropic/v1/messages', {
+    model: 'm', stream: true,
+    thinking: { type: 'enabled' },
+    tools: [{ type: 'deepseek_read_url', name: 'deepseek_read_url' }, { type: 'deepseek_web_search', name: 'deepseek_web_search' }],
+    messages: [{ role: 'user', content: '开关驱动' }],
+  });
+  const types = blockTypes(res.text);
+  assert.ok(types.includes('thinking'), JSON.stringify(types));
+  assert.ok(types.includes('server_tool_use/deepseek_web_search'), JSON.stringify(types));
+
+  // 只声明 read_url 且正文没有链接 → 不出联网块，仍是纯复读
+  const plain = await post('/anthropic/v1/messages', {
+    model: 'm', stream: true,
+    thinking: { type: 'disabled' },
+    tools: [{ type: 'deepseek_read_url', name: 'deepseek_read_url' }],
+    messages: [{ role: 'user', content: '没有链接也没有开关' }],
+  });
+  assert.deepStrictEqual(blockTypes(plain.text), ['text'], JSON.stringify(blockTypes(plain.text)));
+  assert.ok(deltas(plain.text).join('').includes('没有链接也没有开关'));
+});
+
+test('E-18 正文带链接 + 声明 deepseek_read_url → 出 read_link 与 web_fetch_tool_result', async () => {
+  const res = await post('/anthropic/v1/messages', {
+    model: 'm', stream: true,
+    tools: [{ type: 'deepseek_read_url', name: 'deepseek_read_url' }],
+    messages: [{ role: 'user', content: '读一下 https://docs.example.org/api/create-message 讲什么' }],
+  });
+  const types = blockTypes(res.text);
+  assert.ok(types.includes('server_tool_use/deepseek_read_url'), JSON.stringify(types));
+  const fetch = events(res.text).find((o) => o.content_block && o.content_block.type === 'web_fetch_tool_result');
+  assert.ok(fetch, JSON.stringify(types));
+  assert.strictEqual(fetch.content_block.kind, 'read_link');
+  assert.ok(fetch.content_block.signature, 'read_link 结果应带 signature（多轮回传用）');
+  assert.strictEqual(fetch.content_block.content.type, 'web_fetch_result');
+});
+
+// ---------------------------------------------------------- 智能体演示
+
+test('E-19 任务 1：完整「思考 → 搜索 → 引用 → 报告」事件序列 + 自动标题', async () => {
+  const res = await post('/anthropic/v1/messages', {
+    model: 'm', stream: true,
+    messages: [{ role: 'user', content: '/agent 1\n深圳今天天气和出行建议' }],
+  });
+  const types = blockTypes(res.text);
+  assert.deepStrictEqual(types, [
+    'thinking', 'server_tool_use/deepseek_web_search', 'web_search_tool_result', 'text',
+  ], JSON.stringify(types));
+  assert.ok(deltas(res.text).join('').includes('深圳今天天气和出行建议'), '报告应围绕用户问题');
+  const md = events(res.text).find((o) => o.type === 'message_delta');
+  assert.strictEqual(md.delta.stop_reason, 'end_turn');
+  assert.ok(md.delta.title, '任务应产出会话标题');
+  assert.match(res.text, /event: message_stop/);
+
+  // 工作流轨迹可观测
+  const wf = JSON.parse((await get('/__workflow')).text);
+  const run = wf.runs.find((r) => r.agent && r.agent.id === 1);
+  assert.ok(run && run.timeline.length === 4, JSON.stringify(run && run.timeline));
+});
+
+test('E-20 任务 2：阅读链接 + 附件引用出现在结论里', async () => {
+  const res = await post('/anthropic/v1/messages', {
+    model: 'm', stream: true,
+    messages: [{ role: 'user', content: [
+      { type: 'file', file_id: 'file-demo-1' },
+      { type: 'text', text: '/agent 2\n结合这个文件读 https://weather.example.org/shenzhen/today' },
+    ] }],
+  });
+  const types = blockTypes(res.text);
+  assert.ok(types.includes('server_tool_use/deepseek_read_url'), JSON.stringify(types));
+  const joined = deltas(res.text).join('');
+  assert.ok(joined.includes('file-demo-1'), '附件 file_id 应进入总结：' + joined.slice(0, 120));
+  assert.ok(/链接内容摘要/.test(joined));
+});
+
+test('E-21 任务 3：第 1 轮 tool_use 收尾，回传 tool_result 后第 2 轮正常汇总', async () => {
+  const first = await post('/anthropic/v1/messages', {
+    model: 'm', stream: true,
+    messages: [{ role: 'user', content: '/agent 3\n分析近 7 天订单异常' }],
+  });
+  const types = blockTypes(first.text);
+  assert.ok(types.some((t) => t.startsWith('tool_use')), JSON.stringify(types));
+  const md1 = events(first.text).find((o) => o.type === 'message_delta');
+  assert.strictEqual(md1.delta.stop_reason, 'tool_use', '第 1 轮必须以 tool_use 结束');
+
+  const second = await post('/anthropic/v1/messages', {
+    model: 'm', stream: true,
+    messages: [
+      { role: 'user', content: '/agent 3\n分析近 7 天订单异常' },
+      { role: 'assistant', content: [
+        { type: 'text', text: '我先调用工具' },
+        { type: 'tool_use', id: 'toolu_1', name: 'query_orders', input: { range: '7d' } },
+      ] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: '[{"id":101,"abnormal":true}]' }] },
+    ],
+  });
+  const md2 = events(second.text).find((o) => o.type === 'message_delta');
+  assert.strictEqual(md2.delta.stop_reason, 'end_turn');
+  assert.ok(deltas(second.text).join('').includes('执行结果汇总'), deltas(second.text).join('').slice(0, 120));
+  assert.match(second.text, /event: message_stop/);
+});
+
+test('E-22 智能体演示的其余入口与边界：query / metadata / 未知任务 / 半截收场', async () => {
+  const byQuery = await post('/anthropic/v1/messages?agent=1', {
+    model: 'm', stream: true, messages: [{ role: 'user', content: '用 query 触发演示' }],
+  });
+  assert.ok(blockTypes(byQuery.text).includes('server_tool_use/deepseek_web_search'), JSON.stringify(blockTypes(byQuery.text)));
+
+  const byMeta = await post('/anthropic/v1/messages', {
+    model: 'm', stream: true, metadata: { mock: { agent: 2 } },
+    messages: [{ role: 'user', content: '用 metadata 触发演示' }],
+  });
+  assert.ok(blockTypes(byMeta.text).some((t) => t.startsWith('server_tool_use/deepseek_read_url')), JSON.stringify(blockTypes(byMeta.text)));
+
+  const bad = await post('/anthropic/v1/messages', {
+    model: 'm', stream: true, messages: [{ role: 'user', content: '/agent 9' }],
+  });
+  assert.strictEqual(bad.status, 400, bad.text.slice(0, 120));
+
+  const cut = await post('/anthropic/v1/messages', {
+    model: 'm', stream: true, messages: [{ role: 'user', content: '/agent 1\n/stopat 3\n演示中断' }],
+  });
+  assert.ok(!/event: message_stop/.test(cut.text), 'stopAt 之后不得出现 message_stop');
+
+  const tasks = JSON.parse((await get('/agent/tasks')).text);
+  assert.strictEqual(tasks.tasks.length, 3, '预置任务应为 3 个');
+  assert.ok(tasks.tasks.every((t) => t.name && t.workflow.length), '每个任务都应有名称与工作流说明');
+});
+
+test('E-23 非流式的智能体演示：content 里按顺序给出各类块', async () => {
+  const res = await post('/anthropic/v1/messages', {
+    model: 'm', stream: false,
+    messages: [{ role: 'user', content: '/agent 1\n非流式演示' }],
+  });
+  const o = JSON.parse(res.text);
+  assert.deepStrictEqual(o.content.map((b) => b.type + (b.name ? '/' + b.name : '')), [
+    'thinking', 'server_tool_use/deepseek_web_search', 'web_search_tool_result', 'text',
+  ], JSON.stringify(o.content.map((b) => b.type)));
+  assert.ok(o.content[0].signature, '非流式思考块也应带 signature');
+  assert.ok(o.content[3].citations.length >= 1, '非流式正文应带引用');
+  assert.strictEqual(o.stop_reason, 'end_turn');
+});
+
+test('E-24 OpenAI 形状同样支持思考 / 联网 / 演示', async () => {
+  const res = await post('/v1/chat/completions', {
+    model: 'echo', stream: true,
+    messages: [{ role: 'user', content: '/think\n/search 2\nOpenAI 形态演示' }],
+  });
+  const ev = events(res.text);
+  assert.ok(ev.some((o) => o.choices && o.choices[0].delta.reasoning_content), '应有 reasoning_content 增量');
+  assert.ok(ev.some((o) => o.choices && o.choices[0].delta.tool_calls), '应有 tool_calls 增量');
+  assert.ok(ev.some((o) => o.choices && o.choices[0].delta.references), '应有 references（搜索结果）');
+  const openAiBody = deltas(res.text).join('');
+  assert.ok(openAiBody.includes('OpenAI 形态演示'), `正文仍应复读：${openAiBody.slice(0, 120)}`);
+  assert.strictEqual(ev.at(-1).choices[0].finish_reason, 'stop');
+  assert.match(res.text, /data: \[DONE\]/);
+});
+

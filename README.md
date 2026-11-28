@@ -395,7 +395,7 @@ npm run mock:echo
 npm start
 ```
 
-- 浏览器打开 <http://127.0.0.1:8788> = 自带极简测试台，绕开登录直接打 `/v1/chat/completions`，可单独确认复读机本身工作。
+- 浏览器打开 <http://127.0.0.1:8788> = 自带测试台：除了复读，还能勾选「思考 / 联网 / 回复表随机 / 生成标题」，或直接点三个**智能体演示任务**，页面会列出本次响应的完整事件时间线。
 - 端点覆盖后台用到的全部上游路径：`/anthropic/v1/messages`（Anthropic 流式 + 非流式）、`/v1/chat/completions`（OpenAI 流式 + 非流式）、`/models`、`/anthropic/v1/files`、`/v1/tools/asr`、`/v1/tools/tts`。
 - 复读正文会附一行元信息（`model` / `stream` / `user轮次` / `system 字数` / `非文本块`），**附件是否真送到上游一眼可见**；`GET /__calls` 看上游收到的完整请求，`POST /__reset` 清空。
 - 在聊天框正文首行打命令即可注入故障，不必改代码或配置（也支持 `?fail=500` query 与 `metadata.mock`）：
@@ -403,6 +403,7 @@ npm start
   | 命令 | 效果 |
   | --- | --- |
   | `/fail 500` / `429` / `400` / `network` / `idle` / `errorframe` | 上游异常：真实状态码 / 掐 socket / 发一帧后永久静默 |
+  | `/fail refusal` | `stop_reason=refusal`（前端按协议丢弃思考与正文） |
   | `/delay 3s` | 首字节延迟（测 headers 超时与前端 loading） |
   | `/gap 300` | 每个增量间隔 300ms（测心跳、慢流） |
   | `/stopat 5` | 只发 5 块就断，不发 `message_stop`（测断点续推） |
@@ -411,8 +412,54 @@ npm start
   | `/mode upper\|reverse\|count` | 大写 / 倒序 / 只报字数 |
   | `/stop max_tokens` | 指定 `stop_reason` |
 
+### 回复表与随机回复
+
+内置 12 条回复（`scripts/echo-fixtures.js` 的 `REPLY_TABLE`，覆盖打招呼 / 天气 / 代码 / 表格 / 长文本 / 短答等形态），随机挑一条当正文：
+
+| 用法 | 效果 |
+| --- | --- |
+| `/mode random`、`?random=1`、`metadata.mock.random` | 从回复表随机选一条作为内容回复 |
+| `/reply r04`（或 `?reply=4`） | 固定选某一条（按 id 或序号），便于断言 |
+| `/seed 42` | 固定随机序列：同 seed 每次选同一条（单测可复现） |
+| `GET /__replies` | 查看当前回复表（id / topic / 字数） |
+| `POST /__replies {"replies":[{"id":"z1","topic":"演示","text":"…"}]}` | 运行时换表；`{"reset":true}` 还原默认 |
+
+### 思考与联网（与前端开关一一对应）
+
+两种触发方式等价，**不用改任何代码**：
+
+- **跟随请求**（真实 API 语义）：`thinking.type="enabled"` 出思考块；`tools` 声明 `deepseek_web_search` 出联网搜索块；声明 `deepseek_read_url` 且正文里有 `http(s)` 链接出阅读链接块；`title.enabled` 时在 `message_delta` 带回会话标题。
+- **命令行**：`/think`、`/search 3`（3 = 结果条数）、`/title`；也可用 `?think=1&search=3` 或 `metadata.mock.{think,search,title}`。
+
+发出的事件序列与 `chat-demo/src/services/api/types.ts` + `parseEvent.ts` 的校验规则逐字段对齐：
+
+```text
+message_start
+content_block_start(thinking) → thinking_delta × N → signature_delta → content_block_stop
+content_block_start(server_tool_use / deepseek_web_search) → content_block_stop
+content_block_start(web_search_tool_result) → content_block_stop
+content_block_start(text) → text_delta × N（其间穿插 citations_delta）→ content_block_stop
+message_delta（stop_reason + title + usage，含 server_tool_use.web_search_requests）
+message_stop
+```
+
+搜索结果取自本地假数据（域名一律用 RFC 2606 保留的 `example.org` / `example.com`），**不联网、不产生费用**。OpenAI 形状同时支持：思考走 `delta.reasoning_content`，搜索结果走 `delta.references`，工具调用走 `delta.tool_calls`。
+
+### 智能体演示模式（预置三个任务）
+
+| 任务 | 触发 | 展示的完整链路 |
+| --- | --- | --- |
+| 1 实时联网问答 | `/agent 1` | 思考 → `server_tool_use(deepseek_web_search)` → `web_search_tool_result`（3 条）→ 正文 + `citations_delta` → `end_turn` + 会话标题 + `usage.server_tool_use` |
+| 2 链接阅读 + 附件分析 | `/agent 2` | 思考 → `server_tool_use(deepseek_read_url)` → `web_fetch_tool_result`（带 `signature`）→ 摘要 + 表格（含 `file_id` 引用）→ `end_turn` + 标题 |
+| 3 多步智能体循环 | `/agent 3` | 第 1 轮：思考（计划）→ 正文 → `tool_use` → **`stop_reason=tool_use`**；回传 `tool_result` 后第 2 轮自动汇总 → `end_turn`（检测到 `tool_result` 即续跑，无需再打命令） |
+
+- 入口等价：正文首行 `/agent 1`、`?agent=1`、`metadata.mock.agent`；未知任务号返回 400。
+- `GET /agent/tasks` 返回三个任务的名称与工作流说明；`GET /__workflow` 返回最近若干次播放的事件轨迹（第几块、什么事件、正文预览），用于对照「API 响应逻辑是否走全」。
+- 演示任务同样接受 `/gap`、`/stopat`、`/tokens`、`/fail` 等注入，可顺带演练中断续推与错误分支。
+- 相关文件：`scripts/echo-fixtures.js`（回复表 / 搜索结果 / 三个任务脚本）、`scripts/echo-play.js`（steps → 四种响应形态的播放器）。
+
 ```bash
-npm run test:echo      # 复读机自身 12 项单测（零依赖）
+npm run test:echo      # 复读机自身 24 项单测（零依赖）
 npm run smoke:echo     # 复读机 × 中转链路 端到端 19 项（自起服务，不需 MySQL/Redis/远程 Key）
 ```
 
