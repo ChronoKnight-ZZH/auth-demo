@@ -33,6 +33,7 @@
     "smoke": "node scripts/smoke.js",
     "smoke:stream": "node scripts/smoke-stream.js",
     "smoke:echo": "node scripts/smoke-echo.js",
+    "smoke:agent": "node scripts/smoke-agent.js",
     "test:echo": "node test/echo-upstream.test.js",
     "verify:gate": "node scripts/verify-gate.js",
     "verify:webcrypto": "node scripts/verify-webcrypto.js",
