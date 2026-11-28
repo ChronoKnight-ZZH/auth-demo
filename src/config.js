@@ -322,6 +322,12 @@ const config = {
     queuePrefix: process.env.AGENT_QUEUE_PREFIX || 'agent',
     /** Redis 异常时不能拖住 API：投递超时后任务保持 queued，由巡检/补偿接管 */
     queueEnqueueTimeoutMs: int('AGENT_QUEUE_ENQUEUE_TIMEOUT_MS', 3_000),
+    /**
+     * 排队上限：任务停留在 queued 超过这个时间仍没人领取，判定 timed_out。
+     * 没有它，queue=off / bullmq 但 Worker 未启动时，任务会永远停在 queued，
+     * 前端只能无限轮询（表现为「长时间无响应」）。
+     */
+    queueTimeoutMs: int('AGENT_QUEUE_TIMEOUT_MS', 60_000),
     workerConcurrency: int('AGENT_WORKER_CONCURRENCY', 1),
     /** Agent 独立连接池；2C4G 机器不宜与现有池叠加过大 */
     mysqlPoolSize: int('AGENT_MYSQL_POOL_SIZE', 4),
@@ -377,6 +383,12 @@ function validateConfig() {
   }
   if (config.agent.queueEnqueueTimeoutMs < 100) {
     errors.push('AGENT_QUEUE_ENQUEUE_TIMEOUT_MS 不得小于 100ms');
+  }
+  if (config.agent.queueTimeoutMs < 1000) {
+    errors.push('AGENT_QUEUE_TIMEOUT_MS 不得小于 1000ms（否则任务刚提交就会被判排队超时）');
+  }
+  if (config.agent.queueTimeoutMs >= config.agent.taskTimeoutMs) {
+    errors.push('AGENT_QUEUE_TIMEOUT_MS 必须小于 AGENT_TASK_TIMEOUT_MS');
   }
   if (config.agent.retentionDays < 1
     || config.agent.logRetentionDays < 1

@@ -222,6 +222,23 @@ class MysqlAgentTaskRepository extends AgentTaskRepository {
     return rows[0] ? toTask(rows[0]) : null;
   }
 
+  /**
+   * 巡检用：仍处于活动态但已过期（排队超时或总时限已到）的任务 ID。
+   * 两个条件分别命中各自的状态集合，避免把 running 误判成排队超时。
+   */
+  async findStale({ queuedBefore, deadlineBefore, limit = 50 } = {}) {
+    const size = Math.max(1, Math.min(500, Number(limit) || 50));
+    const [rows] = await this.pool.query(
+      `SELECT id FROM agent_tasks
+        WHERE (status = 'queued' AND created_at <= ?)
+           OR (status IN ('running', 'waiting_model') AND deadline_at IS NOT NULL AND deadline_at <= ?)
+        ORDER BY updated_at ASC
+        LIMIT ${size}`,
+      [queuedBefore, deadlineBefore]
+    );
+    return rows.map((row) => row.id);
+  }
+
   async findByIdempotencyKey(userId, key) {
     if (!key) return null;
     const [rows] = await this.pool.execute(

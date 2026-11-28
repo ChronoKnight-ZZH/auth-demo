@@ -19,6 +19,8 @@ const TRANSITIONS = Object.freeze({
     TASK_STATUS.RUNNING,
     TASK_STATUS.FAILED,
     TASK_STATUS.CANCELLED,
+    // 排队阶段也会超时：没有 Worker 消费时，任务不能永远停在 queued
+    TASK_STATUS.TIMED_OUT,
   ]),
   [TASK_STATUS.RUNNING]: Object.freeze([
     TASK_STATUS.WAITING_MODEL,

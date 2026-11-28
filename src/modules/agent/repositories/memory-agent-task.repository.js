@@ -50,6 +50,18 @@ class MemoryAgentTaskRepository extends AgentTaskRepository {
     return task ? clone(task) : null;
   }
 
+  /** 巡检用：活动态但已过期（排队超时 / 总时限已到）的任务 ID */
+  async findStale({ queuedBefore, deadlineBefore, limit = 50 } = {}) {
+    const out = [];
+    for (const task of this.tasks.values()) {
+      if (out.length >= limit) break;
+      if (task.status === 'queued' && task.createdAt <= queuedBefore) out.push(task.id);
+      else if ((task.status === 'running' || task.status === 'waiting_model')
+        && task.deadlineAt != null && task.deadlineAt <= deadlineBefore) out.push(task.id);
+    }
+    return out;
+  }
+
   async findByIdempotencyKey(userId, key) {
     if (!key) return null;
     for (const task of this.tasks.values()) {

@@ -206,6 +206,14 @@ async function createApp() {
         queueMode: config.agent.queueMode,
         executionEnabled: config.agent.executionEnabled,
         allowlistSize: config.agent.allowlist.length,
+        // 前端按 snake_case 读（services/api/agent.ts），两种命名同时给出，保持一致
+        queue_mode: config.agent.queueMode,
+        execution_enabled: config.agent.executionEnabled,
+        // 谁在消费任务：none = 提交了也只会在队列里等到超时（前端可据此提前提示）
+        consumer: agent.status.hasConsumer ? config.agent.queueMode : 'none',
+        has_consumer: agent.status.hasConsumer,
+        queue_timeout_ms: config.agent.queueTimeoutMs,
+        task_timeout_ms: config.agent.taskTimeoutMs,
       },
       process: processInfo(),
       relay: {

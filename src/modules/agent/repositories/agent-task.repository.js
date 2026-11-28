@@ -28,6 +28,12 @@ class AgentTaskRepository {
   /** 无条件更新（Worker 内部记录计数、错误摘要等），调用方自行保证状态语义 */
   async updateTask(id, patch) { throw new Error('not implemented'); }
 
+  /**
+   * 巡检用：返回仍处于活动态但已过期（排队超时 / 总时限已到）的任务 ID。
+   * @param {{queuedBefore:number, deadlineBefore:number, limit?:number}} criteria
+   */
+  async findStale(criteria) { throw new Error('not implemented'); }
+
   async listSteps(taskId) { throw new Error('not implemented'); }
   async appendStep(step) { throw new Error('not implemented'); }
   async updateStep(taskId, stepIndex, patch) { throw new Error('not implemented'); }

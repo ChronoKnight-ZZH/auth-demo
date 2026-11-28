@@ -6,6 +6,7 @@
  *   npm run dev:local -- --mock                    # 固定 tok0 tok1… 的 mock 上游 :8787
  *   npm run dev:local -- --memory                  # 忽略 .env 的 MySQL/Redis，纯内存后端
  *   npm run dev:local -- --https                   # 后端改用 https（自签证书，缺证书自动生成）
+ *   npm run dev:local -- --agent                   # 开启 Agent：inline 队列，任务在本进程内消费
  *   npm run dev:local -- --port 4000 --upstream-port 8899
  *   npm run dev:local -- --host 0.0.0.0            # 局域网访问
  *
@@ -38,6 +39,7 @@ try {
       mock: { type: 'boolean', default: false },
       memory: { type: 'boolean', default: false },
       https: { type: 'boolean', default: false },
+      agent: { type: 'boolean', default: false },
       port: { type: 'string' },
       'upstream-port': { type: 'string' },
       host: { type: 'string' },
@@ -46,7 +48,7 @@ try {
   }));
 } catch (error) {
   console.error(error.message);
-  console.error('用法：npm run dev:local -- [--mock] [--memory] [--https] [--port 3000] [--upstream-port 8788] [--host 127.0.0.1]');
+  console.error('用法：npm run dev:local -- [--mock] [--memory] [--https] [--agent] [--port 3000] [--upstream-port 8788] [--host 127.0.0.1]');
   process.exit(2);
 }
 
@@ -57,6 +59,7 @@ if (values.help) {
   --mock                 使用 mock-upstream（固定 tok0 tok1…）而非复读机
   --memory               强制内存后端（忽略 .env 的 MySQL/Redis，零依赖）
   --https                后端启用 HTTPS（自动生成自签名证书到 secrets/）
+  --agent                开启 Agent：AGENT_ENABLED=1 + inline 队列（本进程消费任务）
   --port <n>             后端端口，默认 3000
   --upstream-port <n>    测试上游端口，默认 mock=8787 / echo=8788
   --host <h>             后端监听地址，默认 127.0.0.1
@@ -320,6 +323,17 @@ async function main() {
     // 会话 Cookie 打上 Secure，与生产（TLS 终结后）行为一致
     serverEnv.SESSION_COOKIE_SECURE = '1';
     console.log('[dev] --https：后端启用 HTTPS（自签名证书，浏览器需信任）');
+  }
+  if (values.agent) {
+    /**
+     * 本地 Agent：inline 队列由 API 进程自己消费，省掉独立 Worker 与 Redis 依赖。
+     * 阶段 1 的执行器是占位实现，任务会立刻落 failed + AGENT_EXECUTOR_UNAVAILABLE，
+     * 但 queued→running→终态 的全链路（含前端轮询）都能真实跑通。
+     */
+    serverEnv.AGENT_ENABLED = '1';
+    serverEnv.AGENT_QUEUE_MODE = 'inline';
+    serverEnv.AGENT_EXECUTION_ENABLED = '1';
+    console.log('[dev] --agent：Agent 已开启（inline 队列，本进程消费任务）');
   }
   if (values.memory) {
     // 指向空文件：让 load-env 完全跳过 .env，避免其中的 MYSQL_URL/REDIS_URL 生效

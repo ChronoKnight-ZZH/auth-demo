@@ -454,6 +454,146 @@ test('Agent Loop：执行器关闭时拒绝领取任务', async () => {
   await repo.close();
 });
 
+// ---------------------------------------------------------------- 超时兜底
+
+const {
+  staleReason,
+  settleTask,
+  staleWhere,
+  NO_CONSUMER_GRACE_MS,
+} = require('../src/modules/agent/core/task-watchdog');
+
+async function seedTask(repo, over = {}) {
+  const createdAt = over.createdAt ?? Date.now();
+  const task = {
+    id: crypto.randomUUID(),
+    userId: 1,
+    conversationId: null,
+    status: TASK_STATUS.QUEUED,
+    inputText: '兜底测试',
+    currentStep: null,
+    resultText: null,
+    errorCode: null,
+    errorMessage: null,
+    idempotencyKey: null,
+    modelCalls: 0,
+    toolCalls: 0,
+    deadlineAt: createdAt + 600_000,
+    startedAt: null,
+    finishedAt: null,
+    createdAt,
+    updatedAt: createdAt,
+    ...over,
+  };
+  await repo.createTask(task, []);
+  return task;
+}
+
+test('状态机：queued 允许直接到期转 timed_out（没人领取也要能收场）', () => {
+  assert.strictEqual(canTransition(TASK_STATUS.QUEUED, TASK_STATUS.TIMED_OUT), true);
+  assertTransition(TASK_STATUS.QUEUED, TASK_STATUS.TIMED_OUT);
+});
+
+test('watchdog：没有任何消费方时，queued 过宽限期判 AGENT_NO_CONSUMER', () => {
+  const now = 1_800_000_000_000;
+  const reason = staleReason(
+    { status: TASK_STATUS.QUEUED, createdAt: now - NO_CONSUMER_GRACE_MS - 1, deadlineAt: now + 600_000 },
+    { now, queueTimeoutMs: 60_000, hasConsumer: false }
+  );
+  assert.strictEqual(reason.code, 'AGENT_NO_CONSUMER');
+  // 宽限期内不动：给 inline / Worker 一点领取时间
+  assert.strictEqual(
+    staleReason(
+      { status: TASK_STATUS.QUEUED, createdAt: now - 1_000, deadlineAt: now + 600_000 },
+      { now, queueTimeoutMs: 60_000, hasConsumer: false }
+    ),
+    null
+  );
+});
+
+test('watchdog：有生产者但 Worker 掉了 → 排队上限后 AGENT_QUEUE_TIMEOUT', () => {
+  const now = 1_800_000_000_000;
+  const reason = staleReason(
+    { status: TASK_STATUS.QUEUED, createdAt: now - 61_000, deadlineAt: now + 539_000 },
+    { now, queueTimeoutMs: 60_000, hasConsumer: true }
+  );
+  assert.strictEqual(reason.code, 'AGENT_QUEUE_TIMEOUT');
+});
+
+test('watchdog：running / waiting_model 只看 deadline_at', () => {
+  const now = 1_800_000_000_000;
+  for (const status of [TASK_STATUS.RUNNING, TASK_STATUS.WAITING_MODEL]) {
+    const expired = staleReason(
+      { status, createdAt: now - 59_000, deadlineAt: now - 1 },
+      { now, queueTimeoutMs: 60_000, hasConsumer: true }
+    );
+    assert.strictEqual(expired.code, 'AGENT_TASK_TIMEOUT', status);
+    const alive = staleReason(
+      { status, createdAt: now - 59_000, deadlineAt: now + 1 },
+      { now, queueTimeoutMs: 60_000, hasConsumer: true }
+    );
+    assert.strictEqual(alive, null, status);
+  }
+});
+
+test('watchdog：终态任务原样返回，不被兜底覆盖', () => {
+  const now = 1_800_000_000_000;
+  for (const status of [TASK_STATUS.COMPLETED, TASK_STATUS.FAILED, TASK_STATUS.CANCELLED]) {
+    assert.strictEqual(
+      staleReason(
+        { status, createdAt: now - 9_999_999, deadlineAt: now - 1 },
+        { now, queueTimeoutMs: 60_000, hasConsumer: false }
+      ),
+      null, status
+    );
+  }
+});
+
+test('watchdog：settleTask 条件迁移，settle 后已是终态', async () => {
+  const repo = new MemoryAgentTaskRepository();
+  const now = Date.now();
+  const stale = await seedTask(repo, { createdAt: now - 120_000, deadlineAt: now - 1 });
+  const settled = await settleTask(repo, stale, { now, queueTimeoutMs: 60_000, hasConsumer: true });
+  assert.strictEqual(settled.status, TASK_STATUS.TIMED_OUT);
+  assert.strictEqual(settled.errorCode, 'AGENT_TASK_TIMEOUT');
+  assert.strictEqual((await repo.getTaskById(stale.id)).status, TASK_STATUS.TIMED_OUT);
+
+  // 再 settle 一次：终态原样返回
+  const again = await settleTask(repo, settled, { now: now + 1000, queueTimeoutMs: 60_000, hasConsumer: true });
+  assert.strictEqual(again.status, TASK_STATUS.TIMED_OUT);
+  await repo.close();
+});
+
+test('watchdog：findStale 只捞过期的活动任务', async () => {
+  const repo = new MemoryAgentTaskRepository();
+  const now = Date.now();
+  const fresh = await seedTask(repo, { createdAt: now - 1_000 });
+  const stuckQueued = await seedTask(repo, { createdAt: now - 120_000 });
+  const overdueRun = await seedTask(repo, {
+    status: TASK_STATUS.RUNNING, createdAt: now - 120_000, deadlineAt: now - 1, startedAt: now - 120_000,
+  });
+  const done = await seedTask(repo, { status: TASK_STATUS.COMPLETED, createdAt: now - 120_000, deadlineAt: now - 1 });
+
+  const ids = await repo.findStale(staleWhere({ now, queueTimeoutMs: 60_000, hasConsumer: true }));
+  assert.ok(ids.includes(stuckQueued.id), '排队超时应命中');
+  assert.ok(ids.includes(overdueRun.id), 'running 超总时限应命中');
+  assert.ok(!ids.includes(fresh.id), '刚提交的不该命中');
+  assert.ok(!ids.includes(done.id), '终态不该命中');
+  await repo.close();
+});
+
+test('读时兜底：getTask 即收敛，前端不会无限轮询', async () => {
+  const repo = new MemoryAgentTaskRepository();
+  const now = Date.now();
+  const task = await seedTask(repo, { createdAt: now - 120_000 });
+  const getTaskService = createGetTaskService({ taskRepo: repo, queueTimeoutMs: 60_000, hasConsumer: true });
+  const { task: read } = await getTaskService.getTask(1, task.id);
+  assert.strictEqual(read.status, TASK_STATUS.TIMED_OUT);
+  assert.strictEqual(read.errorCode, 'AGENT_QUEUE_TIMEOUT');
+  assert.ok(isTerminalStatus(read.status), '读一次就应为终态');
+  await repo.close();
+});
+
 // ---------------------------------------------------------------- HTTP 路由
 
 async function buildAgentApp({ enabled = true, allowlist = [] } = {}) {
@@ -546,6 +686,31 @@ test('HTTP：创建、查询、取消任务全链路', async () => {
     const again = await call(ctx.base, `/api/agent/tasks/${taskId}/cancel`, { method: 'POST' });
     assert.strictEqual(again.status, 200);
     assert.strictEqual(again.json.cancelled, false);
+  } finally {
+    await ctx.close();
+  }
+});
+
+test('HTTP：轮询到过期任务时直接给出终态（不再一直 queued）', async () => {
+  const ctx = await buildAgentApp();
+  try {
+    const created = await call(ctx.base, '/api/agent/tasks', {
+      method: 'POST',
+      body: { message: '提交给一个没人在跑的队列' },
+    });
+    assert.strictEqual(created.status, 202);
+    const taskId = created.json.task_id;
+
+    // 把创建时间推到排队上限之前，模拟「Worker 没跑」
+    const now = Date.now();
+    await ctx.taskRepo.updateTask(taskId, { status: TASK_STATUS.QUEUED, createdAt: now - 3_600_000 });
+
+    const fetched = await call(ctx.base, `/api/agent/tasks/${taskId}`);
+    assert.strictEqual(fetched.json.status, TASK_STATUS.TIMED_OUT, JSON.stringify(fetched.json.error));
+    assert.strictEqual(fetched.json.error.code, 'AGENT_QUEUE_TIMEOUT');
+    // 再读一次仍是终态，不会回退
+    const again = await call(ctx.base, `/api/agent/tasks/${taskId}`);
+    assert.strictEqual(again.json.status, TASK_STATUS.TIMED_OUT);
   } finally {
     await ctx.close();
   }

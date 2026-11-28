@@ -390,7 +390,7 @@ NODE
 | `/api/agent/*` 返回 503 `AGENT_DISABLED` | 检查 `AGENT_ENABLED`，重启 API |
 | 名单内用户仍 403 | 检查 `AGENT_ALLOWLIST` 是否为数字用户 ID，重启 API |
 | 创建任务返回 500 | 检查 MySQL 表是否存在、应用账号权限、`journalctl -u auth-demo` |
-| 创建任务成功但一直 `queued` | 阶段 1 预期行为；确认 `AGENT_QUEUE_MODE=off`、未启动 Worker |
+| 创建任务成功但一直 `queued` | 阶段 1 无消费方时约 10s 后转 `failed` + `AGENT_NO_CONSUMER`，排队超 `AGENT_QUEUE_TIMEOUT_MS` 转 `timed_out`；仍不收敛就确认 `AGENT_QUEUE_MODE`、`AGENT_EXECUTION_ENABLED` 与 Worker 进程状态 |
 | 需要紧急关闭 | `AGENT_ENABLED=0` → `systemctl restart auth-demo`；保留表和数据 |
 | 需要清理验收数据 | 按 `task_id` 删除任务，步骤/文件随外键级联删除 |
 

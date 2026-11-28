@@ -75,6 +75,12 @@ const CODES = {
   AGENT_TOOL_INVALID_INPUT: [400, '工具参数无效'],
   /** 工具执行超时 */
   AGENT_TOOL_TIMEOUT: [504, '工具执行超时'],
+  /** 任务超过总时限（由 watchdog 收场） */
+  AGENT_TASK_TIMEOUT: [504, 'Agent 任务超过总时限'],
+  /** 排队超时：已投递但没有 Worker 在期限内领取 */
+  AGENT_QUEUE_TIMEOUT: [504, 'Agent 任务排队超时，没有 Worker 领取'],
+  /** 没有任何消费方：AGENT_QUEUE_MODE=off 或 AGENT_EXECUTION_ENABLED=0 */
+  AGENT_NO_CONSUMER: [503, 'Agent 任务没有可用的执行进程'],
 };
 
 class AppError extends Error {

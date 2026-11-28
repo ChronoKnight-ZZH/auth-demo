@@ -291,6 +291,8 @@ AGENT_ENABLED=1                  # 总开关，默认 0
 AGENT_ALLOWLIST=1,2              # 可选；留空 = 所有已登录用户
 AGENT_EXECUTION_ENABLED=0        # 阶段 1 必须为 0
 AGENT_QUEUE_MODE=off             # off = 只落库排队
+AGENT_QUEUE_TIMEOUT_MS=60000     # 排队上限：没人领取就判 timed_out
+AGENT_TASK_TIMEOUT_MS=600000     # 任务总时限
 ```
 
 - 接口：`POST/GET /api/agent/tasks`、`POST /api/agent/tasks/:id/cancel`、
@@ -298,7 +300,19 @@ AGENT_QUEUE_MODE=off             # off = 只落库排队
 - 任务、步骤、文件分别存 `agent_tasks` / `agent_task_steps` / `agent_task_files`；
   MySQL 是状态唯一事实来源，所有用户侧查询都带 `user_id`，跨用户统一 404。
 - 状态机：`queued → running → waiting_model → completed/failed/cancelled/timed_out`；
-  终态不可回退，取消不会被 Worker 覆盖。
+  终态不可回退，取消不会被 Worker 覆盖；`queued` 也可直接到期转 `timed_out`。
+- **超时兜底（避免前端无限等待）**：`src/modules/agent/core/task-watchdog.js` 在
+  「读任务」与「30s 巡检」两个触发点收场过期活动态任务：
+  没有消费方（`queue=off` 或 `executor=0`）超过 10s → `failed` + `AGENT_NO_CONSUMER`；
+  排队超过 `AGENT_QUEUE_TIMEOUT_MS` → `timed_out` + `AGENT_QUEUE_TIMEOUT`；
+  超过 `deadline_at` → `timed_out` + `AGENT_TASK_TIMEOUT`。
+  迁移都是条件更新，不会覆盖并发写入的终态。
+- `/health` 的 `agent` 块同时输出 camelCase 与 snake_case，并给出 `consumer`
+  （`inline` / `bullmq` / `none`）与 `has_consumer`：前端据此判断「提交了也没人执行」，
+  在卡片上直接给文案，而不是让用户干等（见 chat-demo `services/api/agent.ts`）。
+- 本地联调：`npm run dev:local -- --agent` 会以 `AGENT_QUEUE_MODE=inline` +
+  `AGENT_EXECUTION_ENABLED=1` 启动后端，任务在本进程内被领取（阶段 1 占位执行器
+  会立刻落 `failed` + `AGENT_EXECUTOR_UNAVAILABLE`，全链路状态流转可验证）。
 - 附件只接受当前用户已上传的 `file_ids`，创建时保存授权快照；输出归档、模型循环、
   Docker 执行器与定时清理在后续阶段接入。
 

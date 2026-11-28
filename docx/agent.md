@@ -95,7 +95,11 @@ queued ──► running ──► waiting_model ──► running
 - 任务与日志的定时清理（保留期配置已就绪）；
 - 前端 Agent 模式与 HTTP 轮询。
 
-`AGENT_QUEUE_MODE=off` 时任务会稳定停留在 `queued`，这是阶段 1 的预期行为。
+`AGENT_QUEUE_MODE=off` 时任务不会自动执行；但阶段 1 已加超时兜底（`core/task-watchdog.js`）：
+没有消费方时任务约 10s 后落 `failed` + `AGENT_NO_CONSUMER`，排队超过 `AGENT_QUEUE_TIMEOUT_MS`
+落 `timed_out` + `AGENT_QUEUE_TIMEOUT`，超过 `deadline_at` 落 `timed_out` + `AGENT_TASK_TIMEOUT`。
+读任务（前端轮询）与 30s 巡检都会触发，因此前端不会再出现「提交后长时间无响应」。
+`/health` 的 `agent.consumer` / `agent.has_consumer` 用于让前端提前判断有没有执行进程。
 
 ## 6. Worker
 
